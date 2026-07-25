@@ -69,13 +69,10 @@ class StreamRuntime:
         if duplicates:
             raise ValueError(f"duplicate collector source identities: {', '.join(duplicates)}")
 
-        self.sinks = tuple(
-            self.sink_registry.create(sink)
-            for sink in config.sinks
-            if sink.enabled
-        )
-        for sink in self.sinks:
-            self.store.register_delivery_sink(sink.key)
+        enabled_sink_configs = tuple(sink for sink in config.sinks if sink.enabled)
+        self.sinks = tuple(self.sink_registry.create(sink) for sink in enabled_sink_configs)
+        for sink_config, sink in zip(enabled_sink_configs, self.sinks, strict=True):
+            self.store.register_delivery_sink(sink.key, backfill=sink_config.backfill)
         self.delivery = DeliveryEngine(
             self.store,
             self.sinks,

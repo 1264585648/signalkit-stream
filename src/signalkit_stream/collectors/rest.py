@@ -19,7 +19,6 @@ from signalkit_stream.protocol import (
 )
 
 PaginationMode = Literal["page", "offset"]
-InitialBackfill = bool | Literal["latest"]
 
 
 class GenericRESTCollector(HTTPCollector):
@@ -55,7 +54,7 @@ class GenericRESTCollector(HTTPCollector):
         limit_param: str = "limit",
         page_size: int = 100,
         seen_window: int = 500,
-        initial_backfill: InitialBackfill = True,
+        initial_backfill: bool = True,
         client: httpx.AsyncClient | None = None,
         timeout: float = 20.0,
         retry_policy: RetryPolicy | None = None,
@@ -82,6 +81,8 @@ class GenericRESTCollector(HTTPCollector):
             raise ValueError("page_size must be >= 1")
         if seen_window < 1:
             raise ValueError("seen_window must be >= 1")
+        if not isinstance(initial_backfill, bool):
+            raise ValueError("initial_backfill must be a boolean")
 
         super().__init__(client=client, timeout=timeout, retry_policy=retry_policy)
         self.url = url
@@ -105,7 +106,7 @@ class GenericRESTCollector(HTTPCollector):
         self.limit_param = limit_param
         self.page_size = page_size
         self.seen_window = seen_window
-        self.initial_backfill = bool(initial_backfill)
+        self.initial_backfill = initial_backfill
 
     async def collect(
         self,
@@ -161,8 +162,33 @@ class GenericRESTCollector(HTTPCollector):
                 retryable=False,
             )
 
+        if not initialized and not self.initial_backfill:
+            bootstrap_ids = [
+                _required_text(raw, self.id_field, source_key=self.identity.key)
+                for raw in raw_items
+                if isinstance(raw, Mapping)
+            ]
+            return CollectorResult(
+                events=[],
+                cursor=Cursor(
+                    self.identity.key,
+                    {
+                        "initialized": True,
+                        "seen_ids": _merge_seen(bootstrap_ids, seen_ids, limit=self.seen_window),
+                        "cycle_ids": [],
+                        "page": 1,
+                        "offset": 0,
+                    },
+                ),
+                has_more=False,
+                primary_count=0,
+                rate_limit=self.rate_limit,
+                warnings=[
+                    "initial_backfill=false seeded the recent REST watermark without emitting history"
+                ],
+            )
+
         events: list[SignalEvent] = []
-        emitted_ids: list[str] = []
         scanned_ids: list[str] = []
         complete = False
         page_fully_scanned = True
@@ -180,19 +206,14 @@ class GenericRESTCollector(HTTPCollector):
             if initialized and external in seen:
                 complete = True
                 break
-            if not initialized and not self.initial_backfill:
-                complete = True
 
             events.append(self._event(raw, external_id=external))
-            emitted_ids.append(external)
             if len(events) >= ctx.limit:
                 page_fully_scanned = False
                 break
 
         raw_exhausted = len(raw_items) < request_size
         if raw_exhausted:
-            complete = True
-        if not initialized and not self.initial_backfill:
             complete = True
 
         if complete:
@@ -280,7 +301,7 @@ def _stable_instance(url: str, query: Mapping[str, str]) -> str:
 def _json_payload(response: httpx.Response, *, source_key: str) -> object:
     try:
         return response.json()
-    except (ValueError, json.JSONDecodeError) as exc:
+    except ValueError as exc:
         raise CollectorError(
             "REST endpoint returned invalid JSON",
             kind=CollectorErrorKind.PARSE,

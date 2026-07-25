@@ -78,7 +78,9 @@ sink.send(event)
 
 Dead rows can be replayed without recollecting the source. Optional sink backfill creates missing pending rows for events already in the store.
 
-Delivery is also at-least-once: a process can terminate after a remote consumer accepted a message but before the local row is marked delivered. Webhook sinks therefore emit a stable `Idempotency-Key` based on sink key plus event ID. Non-idempotent consumers should honor it.
+Delivery is at-least-once: a process can terminate after a remote consumer accepted a message but before the local row is marked delivered. Webhook sinks therefore emit a stable idempotency key for the **exact event version**, derived from sink key, stable event ID, and the event fingerprint. Retries of one version share a key; a later source mutation produces a different key.
+
+A source mutation can also happen while an older payload is in flight. The database update trigger resets the delivery row to pending. After the sink call returns, `DeliveryEngine` compares the version it sent with the current stored fingerprint; success for an older payload is treated as superseded and never overwrites the newer pending state.
 
 Multiple configured sinks provide fan-out naturally because each `(sink_key, event_id)` row has independent attempts and failure state.
 

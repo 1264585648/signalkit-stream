@@ -26,6 +26,7 @@ def test_parse_runtime_source_and_sink_options() -> None:
                     "name": "archive",
                     "type": "jsonl",
                     "path": "signals.jsonl",
+                    "backfill": True,
                 }
             ],
         }
@@ -36,6 +37,7 @@ def test_parse_runtime_source_and_sink_options() -> None:
     assert config.runtime.delivery_batch == 25
     assert config.sources[0].options == {"feed": "askstories", "comments": 2}
     assert config.sinks[0].options == {"path": "signals.jsonl"}
+    assert config.sinks[0].backfill is True
 
 
 def test_config_rejects_unknown_runtime_duplicate_sources_and_sinks() -> None:

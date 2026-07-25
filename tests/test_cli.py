@@ -128,3 +128,36 @@ def test_reddit_and_jsonfeed_collectors_are_available_in_cli(monkeypatch) -> Non
     monkeypatch.delenv("REDDIT_USER_AGENT", raising=False)
     with pytest.raises(SystemExit, match="REDDIT_CLIENT_ID"):
         main(["collect", "reddit", "SaaS", "--no-store"])
+
+
+def test_validate_and_doctor_commands(tmp_path, capsys) -> None:
+    database = tmp_path / "signals.db"
+    config = tmp_path / "signalkit.toml"
+    config.write_text(
+        f'''[runtime]
+database = "{database.as_posix()}"
+
+[[sources]]
+name = "hn"
+type = "hackernews"
+feed = "newstories"
+''',
+        encoding="utf-8",
+    )
+
+    assert main(["validate", str(config), "--format", "json"]) == 0
+    validate_output = capsys.readouterr().out
+    assert '"ok": true' in validate_output
+    assert '"source:hn"' in validate_output
+
+    assert main(["doctor", str(config), "--format", "json"]) == 0
+    doctor_output = capsys.readouterr().out
+    assert '"database-path"' in doctor_output
+    assert '"status": "warn"' in doctor_output
+
+    with SQLiteSignalStore(database):
+        pass
+    assert main(["doctor", str(config)]) == 0
+    table_output = capsys.readouterr().out
+    assert "database-integrity" in table_output
+    assert "PASS" in table_output

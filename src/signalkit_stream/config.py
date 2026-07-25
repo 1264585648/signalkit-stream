@@ -67,6 +67,7 @@ class SinkConfig:
     name: str
     type: str
     enabled: bool = True
+    backfill: bool = False
     options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -109,7 +110,7 @@ _RUNTIME_KEYS = {
     "delivery_backoff_max",
 }
 _SOURCE_KEYS = {"name", "type", "interval", "limit", "enabled"}
-_SINK_KEYS = {"name", "type", "enabled"}
+_SINK_KEYS = {"name", "type", "enabled", "backfill"}
 
 
 def load_config(path: str | Path) -> StreamConfig:
@@ -203,6 +204,7 @@ def parse_config(payload: Mapping[str, Any]) -> StreamConfig:
                 name=name,
                 type=sink_type,
                 enabled=_bool(raw.get("enabled", True), f"sink {name!r}.enabled"),
+                backfill=_bool(raw.get("backfill", False), f"sink {name!r}.backfill"),
                 options=options,
             )
         )
@@ -251,12 +253,14 @@ comments = 0
 # name = "archive"
 # type = "jsonl"
 # path = "signals.jsonl"
+# backfill = false
 
 # [[sinks]]
 # name = "brain-webhook"
 # type = "webhook"
 # url = "https://example.com/signals"
 # token_env = "SIGNALKIT_WEBHOOK_TOKEN"
+# backfill = false
 '''
 
 

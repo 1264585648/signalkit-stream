@@ -9,6 +9,14 @@ from signalkit_stream.config import (
 )
 from signalkit_stream.contracts import validate_collector_result
 from signalkit_stream.delivery import DeliveryEngine, DeliveryResult
+from signalkit_stream.diagnostics import (
+    DiagnosticCheck,
+    DiagnosticReport,
+    DiagnosticStatus,
+    doctor,
+    validate_config_file,
+    validate_stream_config,
+)
 from signalkit_stream.models import SCHEMA_VERSION, SignalEvent, SignalKind
 from signalkit_stream.pipeline import CollectionResult, run_collector
 from signalkit_stream.protocol import (
@@ -43,6 +51,9 @@ __all__ = [
     "DeliveryEngine",
     "DeliveryRecord",
     "DeliveryResult",
+    "DiagnosticCheck",
+    "DiagnosticReport",
+    "DiagnosticStatus",
     "JsonlSink",
     "PROTOCOL_VERSION",
     "RateLimitSnapshot",
@@ -64,9 +75,12 @@ __all__ = [
     "StreamConfig",
     "StreamRuntime",
     "WebhookSink",
+    "doctor",
     "load_config",
     "run_collector",
     "validate_collector_result",
+    "validate_config_file",
+    "validate_stream_config",
 ]
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"

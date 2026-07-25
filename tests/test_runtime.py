@@ -7,7 +7,6 @@ from signalkit_stream.collectors.base import Collector
 from signalkit_stream.config import RuntimeConfig, SourceConfig, StreamConfig
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import (
-    CollectorContext,
     CollectorError,
     CollectorErrorKind,
     CollectorResult,

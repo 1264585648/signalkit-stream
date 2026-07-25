@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from collections.abc import Sequence
+
+from signalkit_stream.collectors import GitHubCollector, HackerNewsCollector, RSSCollector
+from signalkit_stream.models import SignalEvent
+from signalkit_stream.pipeline import run_collector
+from signalkit_stream.storage import SQLiteSignalStore
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="signalkit",
+        description="Collect public web signals into one normalized event stream.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    collect = subparsers.add_parser("collect", help="Collect from a source")
+    collectors = collect.add_subparsers(dest="collector", required=True)
+
+    rss = collectors.add_parser("rss", help="Collect an RSS/Atom feed")
+    rss.add_argument("url")
+    rss.add_argument("--source", default="rss", help="Logical source name stored on events")
+    _add_collection_options(rss)
+
+    hn = collectors.add_parser("hn", help="Collect Hacker News")
+    hn.add_argument(
+        "--feed",
+        default="newstories",
+        choices=[
+            "topstories",
+            "newstories",
+            "beststories",
+            "askstories",
+            "showstories",
+            "jobstories",
+        ],
+    )
+    hn.add_argument(
+        "--comments",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Collect up to N top-level comments per story",
+    )
+    _add_collection_options(hn)
+
+    github = collectors.add_parser("github", help="Search GitHub issues and pull requests")
+    github.add_argument("query", help='GitHub issue search query, e.g. \'"looking for" is:issue\'')
+    github.add_argument(
+        "--comments",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Collect up to N comments per issue/PR",
+    )
+    github.add_argument(
+        "--token-env",
+        default="GITHUB_TOKEN",
+        help="Environment variable containing a GitHub token (default: GITHUB_TOKEN)",
+    )
+    _add_collection_options(github)
+
+    show = subparsers.add_parser("show", help="Read normalized events from SQLite")
+    show.add_argument("--db", default="signals.db")
+    show.add_argument("--limit", type=int, default=20)
+    show.add_argument("--source")
+    show.add_argument("--kind")
+    show.add_argument("--format", choices=["jsonl", "json", "table"], default="table")
+
+    return parser
+
+
+def _add_collection_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--limit", type=int, default=20, help="Maximum primary items to collect")
+    parser.add_argument("--db", default="signals.db", help="SQLite file (default: signals.db)")
+    parser.add_argument("--no-store", action="store_true", help="Do not persist events")
+    parser.add_argument("--format", choices=["jsonl", "json", "table"], default="table")
+
+
+def _format_events(events: Sequence[SignalEvent], output_format: str) -> str:
+    if output_format == "json":
+        return json.dumps([event.to_dict() for event in events], ensure_ascii=False, indent=2)
+    if output_format == "jsonl":
+        return "\n".join(json.dumps(event.to_dict(), ensure_ascii=False) for event in events)
+
+    if not events:
+        return "No events."
+    lines = [f"{'SOURCE':14} {'KIND':14} {'AUTHOR':18} TITLE / CONTENT"]
+    lines.append("-" * 100)
+    for event in events:
+        preview = event.title or event.content or ""
+        preview = " ".join(preview.split())
+        if len(preview) > 48:
+            preview = preview[:45] + "..."
+        author = (event.author or "-")[:18]
+        lines.append(f"{event.source[:14]:14} {event.kind.value[:14]:14} {author:18} {preview}")
+    return "\n".join(lines)
+
+
+async def _run_collect(args: argparse.Namespace) -> int:
+    if args.limit < 1:
+        raise SystemExit("--limit must be >= 1")
+
+    if args.collector == "rss":
+        collector = RSSCollector(args.url, source=args.source)
+    elif args.collector == "hn":
+        collector = HackerNewsCollector(
+            feed=args.feed,
+            include_comments=args.comments > 0,
+            comments_per_story=max(0, args.comments),
+        )
+    elif args.collector == "github":
+        collector = GitHubCollector(
+            args.query,
+            token=os.getenv(args.token_env),
+            include_comments=args.comments > 0,
+            comments_per_item=max(0, args.comments),
+        )
+    else:  # pragma: no cover - argparse prevents this.
+        raise SystemExit(f"unknown collector: {args.collector}")
+
+    if args.no_store:
+        result = await run_collector(collector, limit=args.limit)
+    else:
+        with SQLiteSignalStore(args.db) as store:
+            result = await run_collector(collector, limit=args.limit, store=store)
+
+    print(_format_events(result.events, args.format))
+    if not args.no_store:
+        print(
+            (
+                f"Collected {len(result.events)} events; inserted {result.inserted} "
+                f"new events into {args.db}"
+            ),
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _run_show(args: argparse.Namespace) -> int:
+    with SQLiteSignalStore(args.db) as store:
+        events = store.list_recent(limit=args.limit, source=args.source, kind=args.kind)
+    print(_format_events(events, args.format))
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "collect":
+        return asyncio.run(_run_collect(args))
+    if args.command == "show":
+        return _run_show(args)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -10,7 +10,13 @@ from pathlib import Path
 import signal
 import sys
 
-from signalkit_stream.collectors import GitHubCollector, HackerNewsCollector, RSSCollector
+from signalkit_stream.collectors import (
+    GitHubCollector,
+    HackerNewsCollector,
+    JSONFeedCollector,
+    RSSCollector,
+    RedditCollector,
+)
 from signalkit_stream.config import load_config, sample_config
 from signalkit_stream.models import SignalEvent
 from signalkit_stream.pipeline import run_collector
@@ -33,6 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
     rss.add_argument("--source", default="rss", help="Logical source name stored on events")
     rss.add_argument("--instance", help="Stable source instance name (default: feed URL)")
     _add_collection_options(rss)
+
+    jsonfeed = collectors.add_parser("jsonfeed", help="Collect a JSON Feed 1.x feed")
+    jsonfeed.add_argument("url")
+    jsonfeed.add_argument("--source", default="jsonfeed", help="Logical source name stored on events")
+    jsonfeed.add_argument("--instance", help="Stable source instance name (default: feed URL)")
+    _add_collection_options(jsonfeed)
 
     hn = collectors.add_parser("hn", help="Collect Hacker News")
     hn.add_argument(
@@ -72,6 +84,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     github.add_argument("--instance", help="Stable source instance name (default: query hash)")
     _add_collection_options(github)
+
+    reddit = collectors.add_parser("reddit", help="Collect a subreddit through Reddit OAuth")
+    reddit.add_argument("subreddit", help="Subreddit name, for example SaaS")
+    reddit.add_argument(
+        "--listing",
+        default="new",
+        choices=["new", "hot", "top", "rising"],
+        help="Subreddit listing to poll (default: new)",
+    )
+    reddit.add_argument(
+        "--time-filter",
+        choices=["hour", "day", "week", "month", "year", "all"],
+        help="Reddit time filter used by listings such as top",
+    )
+    reddit.add_argument(
+        "--comments",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Collect up to N top-level comments per post",
+    )
+    reddit.add_argument("--client-id-env", default="REDDIT_CLIENT_ID")
+    reddit.add_argument("--client-secret-env", default="REDDIT_CLIENT_SECRET")
+    reddit.add_argument("--user-agent-env", default="REDDIT_USER_AGENT")
+    reddit.add_argument("--instance", help="Stable source instance name")
+    _add_collection_options(reddit)
 
     init = subparsers.add_parser("init", help="Create a documented runtime configuration")
     init.add_argument("path", nargs="?", default="signalkit.toml")
@@ -211,6 +249,8 @@ async def _run_collect(args: argparse.Namespace) -> int:
 
     if args.collector == "rss":
         collector = RSSCollector(args.url, source=args.source, instance=args.instance)
+    elif args.collector == "jsonfeed":
+        collector = JSONFeedCollector(args.url, source=args.source, instance=args.instance)
     elif args.collector == "hn":
         collector = HackerNewsCollector(
             feed=args.feed,
@@ -223,6 +263,18 @@ async def _run_collect(args: argparse.Namespace) -> int:
             token=os.getenv(args.token_env),
             include_comments=args.comments > 0,
             comments_per_item=max(0, args.comments),
+            instance=args.instance,
+        )
+    elif args.collector == "reddit":
+        collector = RedditCollector(
+            args.subreddit,
+            client_id=_required_env(args.client_id_env),
+            client_secret=_required_env(args.client_secret_env),
+            user_agent=_required_env(args.user_agent_env),
+            listing=args.listing,
+            time_filter=args.time_filter,
+            include_comments=args.comments > 0,
+            comments_per_post=max(0, args.comments),
             instance=args.instance,
         )
     else:  # pragma: no cover - argparse prevents this.
@@ -252,6 +304,13 @@ async def _run_collect(args: argparse.Namespace) -> int:
     for warning in result.warnings:
         print(f"warning: {warning}", file=sys.stderr)
     return 0
+
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise SystemExit(f"required environment variable is not set: {name}")
+    return value
 
 
 def _run_init(args: argparse.Namespace) -> int:
@@ -301,6 +360,7 @@ async def _run_runtime(args: argparse.Namespace) -> int:
                             "delivered": result.delivered,
                             "failed": result.failed,
                             "dead": result.dead,
+                            "superseded": result.superseded,
                         },
                         ensure_ascii=False,
                     )

@@ -131,7 +131,9 @@ class HTTPCollector(Collector):
 
             try:
                 response = await client.request(method, url, **kwargs)
-                self._rate_limit = self._rate_limit_from_headers(response)
+                snapshot = self._rate_limit_from_headers(response)
+                if snapshot is not None:
+                    self._rate_limit = snapshot
 
                 if response.status_code < 400:
                     return response

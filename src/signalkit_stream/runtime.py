@@ -8,9 +8,11 @@ import logging
 
 from signalkit_stream.collectors.base import Collector, HTTPCollector
 from signalkit_stream.config import SourceConfig, StreamConfig
+from signalkit_stream.delivery import DeliveryEngine, DeliveryResult
 from signalkit_stream.pipeline import CollectionResult, run_collector
 from signalkit_stream.protocol import CollectorError, CollectorErrorKind, RateLimitSnapshot
 from signalkit_stream.registry import CollectorRegistry, default_registry
+from signalkit_stream.sinks import SinkRegistry, default_sink_registry
 from signalkit_stream.storage import SQLiteSignalStore, SourceHealth
 
 logger = logging.getLogger(__name__)
@@ -38,7 +40,7 @@ class SourceRunResult:
 
 
 class StreamRuntime:
-    """Long-running scheduler for independent collector workers."""
+    """Long-running collection and durable-delivery scheduler."""
 
     def __init__(
         self,
@@ -46,12 +48,14 @@ class StreamRuntime:
         store: SQLiteSignalStore,
         *,
         registry: CollectorRegistry | None = None,
+        sink_registry: SinkRegistry | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.config = config
         self.store = store
         self.registry = registry or default_registry()
+        self.sink_registry = sink_registry or default_sink_registry()
         self._sleep = sleep
         self._now = now
         self._semaphore = asyncio.Semaphore(config.runtime.concurrency)
@@ -64,6 +68,26 @@ class StreamRuntime:
         duplicates = sorted({key for key in keys if keys.count(key) > 1})
         if duplicates:
             raise ValueError(f"duplicate collector source identities: {', '.join(duplicates)}")
+
+        self.sinks = tuple(
+            self.sink_registry.create(sink)
+            for sink in config.sinks
+            if sink.enabled
+        )
+        for sink in self.sinks:
+            self.store.register_delivery_sink(sink.key)
+        self.delivery = DeliveryEngine(
+            self.store,
+            self.sinks,
+            batch_size=config.runtime.delivery_batch,
+            max_attempts=config.runtime.delivery_max_attempts,
+            backoff_base=config.runtime.delivery_backoff_base,
+            backoff_max=config.runtime.delivery_backoff_max,
+            interval=config.runtime.delivery_interval,
+            sleep=sleep,
+            now=now,
+        )
+        self.last_delivery_results: list[DeliveryResult] = []
         self._restore_health()
 
     def _restore_health(self) -> None:
@@ -77,18 +101,22 @@ class StreamRuntime:
             source.last_success_at = health.last_success_at
 
     async def run_once(self) -> list[SourceRunResult]:
-        """Run every enabled source once, respecting global concurrency."""
+        """Run every enabled source once, then drain one delivery batch per sink."""
 
-        return list(await asyncio.gather(*(self._run_source(source) for source in self.sources)))
+        results = list(await asyncio.gather(*(self._run_source(source) for source in self.sources)))
+        self.last_delivery_results = await self.delivery.deliver_all_once()
+        return results
 
     async def run_forever(self, stop_event: asyncio.Event | None = None) -> None:
-        """Run one worker per source until stopped, then cancel in-flight workers."""
+        """Run independent source and sink workers until stopped."""
 
         stop = stop_event or asyncio.Event()
         tasks = [
             asyncio.create_task(self._source_loop(source, stop), name=f"signalkit:{source.config.name}")
             for source in self.sources
         ]
+        if self.sinks:
+            tasks.append(asyncio.create_task(self.delivery.run_forever(stop), name="signalkit:delivery"))
         if not tasks:
             return
         try:
@@ -97,6 +125,7 @@ class StreamRuntime:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await self.delivery.close()
 
     async def _source_loop(self, source: RuntimeSource, stop: asyncio.Event) -> None:
         while not stop.is_set():

@@ -1,5 +1,7 @@
 """SignalKit Stream: reliable public-signal ingestion for AI agents."""
 
+from signalkit_stream.config import ConfigError, RuntimeSettings, SourceConfig, StreamConfig, load_config
+from signalkit_stream.health import SourceHealth, SQLiteRuntimeStateStore
 from signalkit_stream.models import SCHEMA_VERSION, SignalEvent, SignalKind
 from signalkit_stream.pipeline import CollectionResult, run_collector
 from signalkit_stream.protocol import (
@@ -13,6 +15,7 @@ from signalkit_stream.protocol import (
     RawEvent,
     SourceIdentity,
 )
+from signalkit_stream.runtime import SourceRunOutcome, StreamRuntime
 from signalkit_stream.storage import Checkpoint, SQLiteSignalStore, StoreWriteResult
 
 __all__ = [
@@ -22,17 +25,26 @@ __all__ = [
     "CollectorError",
     "CollectorErrorKind",
     "CollectorResult",
+    "ConfigError",
     "Cursor",
     "PROTOCOL_VERSION",
     "RateLimitSnapshot",
     "RawEvent",
+    "RuntimeSettings",
     "SCHEMA_VERSION",
+    "SQLiteRuntimeStateStore",
     "SQLiteSignalStore",
     "SignalEvent",
     "SignalKind",
+    "SourceConfig",
+    "SourceHealth",
     "SourceIdentity",
+    "SourceRunOutcome",
     "StoreWriteResult",
+    "StreamConfig",
+    "StreamRuntime",
+    "load_config",
     "run_collector",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

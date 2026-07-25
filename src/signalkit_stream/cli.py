@@ -12,16 +12,18 @@ from collections.abc import Sequence
 
 from signalkit_stream.collectors import GitHubCollector, HackerNewsCollector, RSSCollector
 from signalkit_stream.config import load_config, sample_config
+from signalkit_stream.delivery import DeliveryRecord, DeliveryStatus, DeliveryDispatcher, SQLiteDeliveryStore
 from signalkit_stream.models import SignalEvent
 from signalkit_stream.pipeline import run_collector
 from signalkit_stream.runtime import StreamRuntime
+from signalkit_stream.sinks import default_sink_registry
 from signalkit_stream.storage import SQLiteSignalStore, SourceHealth
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="signalkit",
-        description="Collect public web signals into one normalized, resumable event stream.",
+        description="Collect and deliver public web signals through one resumable event stream.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -81,6 +83,32 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("config", nargs="?", default="signalkit.toml")
     run.add_argument("--once", action="store_true", help="Run each enabled source once and exit")
     run.add_argument("--verbose", action="store_true")
+
+    delivery = subparsers.add_parser("delivery", help="Deliver stored events to configured sinks")
+    delivery_commands = delivery.add_subparsers(dest="delivery_command", required=True)
+
+    delivery_run = delivery_commands.add_parser("run", help="Run configured delivery sinks")
+    delivery_run.add_argument("config", nargs="?", default="signalkit.toml")
+    delivery_run.add_argument("--once", action="store_true", help="Run one delivery scan and exit")
+    delivery_run.add_argument("--verbose", action="store_true")
+
+    delivery_status = delivery_commands.add_parser("status", help="Inspect delivery state")
+    delivery_status.add_argument("--db", default="signals.db")
+    delivery_status.add_argument("--sink")
+    delivery_status.add_argument(
+        "--status",
+        choices=[status.value for status in DeliveryStatus],
+    )
+    delivery_status.add_argument("--limit", type=int, default=100)
+    delivery_status.add_argument("--format", choices=["json", "table"], default="table")
+
+    delivery_replay = delivery_commands.add_parser(
+        "replay",
+        help="Replay dead-lettered deliveries without recollecting sources",
+    )
+    delivery_replay.add_argument("sink")
+    delivery_replay.add_argument("--event-id")
+    delivery_replay.add_argument("--db", default="signals.db")
 
     show = subparsers.add_parser("show", help="Read normalized events from SQLite")
     show.add_argument("--db", default="signals.db")
@@ -163,6 +191,39 @@ def _format_health(items: Sequence[SourceHealth], output_format: str) -> str:
         lines.append(
             f"{item.source_key[:32]:32} {item.status[:14]:14} "
             f"{item.consecutive_failures:<7} {item.total_runs:<7} {item.total_events:<8} {success}"
+        )
+    return "\n".join(lines)
+
+
+def _format_delivery(items: Sequence[DeliveryRecord], output_format: str) -> str:
+    if output_format == "json":
+        return json.dumps(
+            [
+                {
+                    "sink_name": item.sink_name,
+                    "event_id": item.event_id,
+                    "event_hash": item.event_hash,
+                    "delivered_hash": item.delivered_hash,
+                    "status": item.status.value,
+                    "attempts": item.attempts,
+                    "last_error": item.last_error,
+                    "next_attempt_at": item.next_attempt_at.isoformat() if item.next_attempt_at else None,
+                    "delivered_at": item.delivered_at.isoformat() if item.delivered_at else None,
+                    "updated_at": item.updated_at.isoformat(),
+                }
+                for item in items
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+    if not items:
+        return "No delivery records."
+    lines = [f"{'SINK':24} {'STATUS':13} {'ATTEMPTS':8} {'EVENT':28} UPDATED"]
+    lines.append("-" * 100)
+    for item in items:
+        lines.append(
+            f"{item.sink_name[:24]:24} {item.status.value[:13]:13} {item.attempts:<8} "
+            f"{item.event_id[:28]:28} {item.updated_at.isoformat(timespec='seconds')}"
         )
     return "\n".join(lines)
 
@@ -271,6 +332,82 @@ async def _run_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_delivery(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    sink_configs = config.enabled_sinks
+    if not sink_configs:
+        print("No enabled sinks configured.", file=sys.stderr)
+        return 2
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    registry = default_sink_registry()
+    sinks = [registry.create(sink_config) for sink_config in sink_configs]
+    with SQLiteDeliveryStore(config.runtime.database) as store:
+        dispatcher = DeliveryDispatcher(
+            store,
+            sinks,
+            max_attempts=config.delivery.max_attempts,
+            backoff_base=config.delivery.backoff_base,
+            max_backoff=config.delivery.max_backoff,
+        )
+        if args.once:
+            results = await dispatcher.run_once(limit_per_sink=config.delivery.batch_size)
+            for result in results:
+                print(
+                    json.dumps(
+                        {
+                            "sink": result.sink_name,
+                            "attempted": result.attempted,
+                            "delivered": result.delivered,
+                            "failed": result.failed,
+                            "dead_lettered": result.dead_lettered,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            return 1 if any(result.failed or result.dead_lettered for result in results) else 0
+
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        installed: list[signal.Signals] = []
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(signum, stop.set)
+                installed.append(signum)
+            except (NotImplementedError, RuntimeError):
+                pass
+        try:
+            await dispatcher.run_forever(
+                interval=config.delivery.interval,
+                limit_per_sink=config.delivery.batch_size,
+                stop_event=stop,
+            )
+        finally:
+            for signum in installed:
+                loop.remove_signal_handler(signum)
+    return 0
+
+
+def _run_delivery_status(args: argparse.Namespace) -> int:
+    with SQLiteDeliveryStore(args.db) as store:
+        records = store.list_records(
+            sink_name=args.sink,
+            status=args.status,
+            limit=args.limit,
+        )
+    print(_format_delivery(records, args.format))
+    return 0
+
+
+def _run_delivery_replay(args: argparse.Namespace) -> int:
+    with SQLiteDeliveryStore(args.db) as store:
+        replayed = store.replay_dead_letters(args.sink, event_id=args.event_id)
+    print(f"Requeued {replayed} dead-lettered delivery record(s).")
+    return 0
+
+
 def _run_show(args: argparse.Namespace) -> int:
     with SQLiteSignalStore(args.db) as store:
         events = store.list_recent(
@@ -322,6 +459,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_init(args)
     if args.command == "run":
         return asyncio.run(_run_runtime(args))
+    if args.command == "delivery":
+        if args.delivery_command == "run":
+            return asyncio.run(_run_delivery(args))
+        if args.delivery_command == "status":
+            return _run_delivery_status(args)
+        if args.delivery_command == "replay":
+            return _run_delivery_replay(args)
     if args.command == "show":
         return _run_show(args)
     if args.command == "checkpoint":

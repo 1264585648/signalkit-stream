@@ -18,6 +18,7 @@ from signalkit_stream.collectors import (
     RedditCollector,
 )
 from signalkit_stream.config import load_config, sample_config
+from signalkit_stream.diagnostics import DiagnosticReport, doctor, validate_config_file
 from signalkit_stream.models import SignalEvent
 from signalkit_stream.pipeline import run_collector
 from signalkit_stream.runtime import StreamRuntime
@@ -114,6 +115,20 @@ def build_parser() -> argparse.ArgumentParser:
     init = subparsers.add_parser("init", help="Create a documented runtime configuration")
     init.add_argument("path", nargs="?", default="signalkit.toml")
     init.add_argument("--force", action="store_true", help="Overwrite an existing file")
+
+    validate = subparsers.add_parser(
+        "validate",
+        help="Validate configuration, adapters, credentials, and sink wiring without network calls",
+    )
+    validate.add_argument("config", nargs="?", default="signalkit.toml")
+    validate.add_argument("--format", choices=["json", "table"], default="table")
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Run local configuration, credential, and SQLite diagnostics",
+    )
+    doctor_parser.add_argument("config", nargs="?", default="signalkit.toml")
+    doctor_parser.add_argument("--format", choices=["json", "table"], default="table")
 
     run = subparsers.add_parser("run", help="Run configured source and sink workers")
     run.add_argument("config", nargs="?", default="signalkit.toml")
@@ -243,6 +258,20 @@ def _format_delivery_counts(
     return "\n".join(lines)
 
 
+def _format_diagnostics(report: DiagnosticReport, output_format: str) -> str:
+    if output_format == "json":
+        return json.dumps(report.to_dict(), ensure_ascii=False, indent=2)
+    if not report.checks:
+        return "No diagnostics."
+    lines = [f"{'STATUS':7} {'CHECK':32} MESSAGE", "-" * 100]
+    for check in report.checks:
+        lines.append(f"{check.status.value.upper():7} {check.name[:32]:32} {check.message}")
+    lines.append(
+        f"result={'ok' if report.ok else 'failed'} warnings={report.warnings} failures={report.failures}"
+    )
+    return "\n".join(lines)
+
+
 async def _run_collect(args: argparse.Namespace) -> int:
     if args.limit < 1:
         raise SystemExit("--limit must be >= 1")
@@ -322,6 +351,18 @@ def _run_init(args: argparse.Namespace) -> int:
     path.write_text(sample_config(), encoding="utf-8")
     print(f"Created {path}")
     return 0
+
+
+def _run_validate(args: argparse.Namespace) -> int:
+    report = validate_config_file(args.config)
+    print(_format_diagnostics(report, args.format))
+    return 0 if report.ok else 1
+
+
+def _run_doctor(args: argparse.Namespace) -> int:
+    report = doctor(args.config)
+    print(_format_diagnostics(report, args.format))
+    return 0 if report.ok else 1
 
 
 async def _run_runtime(args: argparse.Namespace) -> int:
@@ -451,6 +492,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_run_collect(args))
     if args.command == "init":
         return _run_init(args)
+    if args.command == "validate":
+        return _run_validate(args)
+    if args.command == "doctor":
+        return _run_doctor(args)
     if args.command == "run":
         return asyncio.run(_run_runtime(args))
     if args.command == "show":

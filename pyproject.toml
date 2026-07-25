@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signalkit-stream"
-version = "0.1.0"
-description = "A pluggable public-signal ingestion layer for AI agents and lead intelligence workflows."
+version = "0.2.0"
+description = "A reliable, pluggable public-signal ingestion layer for AI agents and lead intelligence workflows."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -36,9 +36,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8.2,<9",
-  "pytest-asyncio>=0.23,<1",
-  "pytest-cov>=5,<7",
+  "pytest>=8.2,<10",
+  "pytest-asyncio>=0.23,<2",
+  "pytest-cov>=5,<8",
   "ruff>=0.6,<1",
 ]
 

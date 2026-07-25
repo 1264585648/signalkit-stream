@@ -7,50 +7,93 @@ from xml.etree import ElementTree as ET
 import httpx
 
 from signalkit_stream.collectors._text import html_to_text
-from signalkit_stream.collectors.base import HTTPCollector
+from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
+from signalkit_stream.protocol import CollectorContext, CollectorError, CollectorErrorKind, CollectorResult, Cursor
 
 
 class RSSCollector(HTTPCollector):
-    """Collect RSS/Atom feeds and emit normalized article events."""
+    """Collect RSS/Atom feeds using conditional requests when checkpoints exist."""
 
     def __init__(
         self,
         url: str,
         *,
         source: str = "rss",
+        instance: str | None = None,
         client: httpx.AsyncClient | None = None,
         timeout: float = 20.0,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
-        super().__init__(client=client, timeout=timeout)
+        super().__init__(client=client, timeout=timeout, retry_policy=retry_policy)
         self.url = url
         self.source = source
+        self.instance = instance or url
 
-    async def collect(self, *, limit: int = 100) -> list[SignalEvent]:
-        if limit < 1:
-            return []
+    async def collect(
+        self,
+        *,
+        context: CollectorContext | None = None,
+        cursor: Cursor | None = None,
+    ) -> CollectorResult:
+        ctx = self.context(context)
+        self.validate_cursor(cursor)
+        headers: dict[str, str] = {}
+        offset = int(cursor.state.get("offset", 0)) if cursor else 0
+        if cursor and offset == 0:
+            if cursor.state.get("etag"):
+                headers["If-None-Match"] = str(cursor.state["etag"])
+            if cursor.state.get("last_modified"):
+                headers["If-Modified-Since"] = str(cursor.state["last_modified"])
 
         async with self.http_client() as client:
-            response = await client.get(self.url)
-            response.raise_for_status()
+            response = await self.request(client, "GET", self.url, context=ctx, headers=headers)
 
-        feed_title, entries = self._parse_feed(response.content)
+        if response.status_code == 304:
+            return CollectorResult(
+                events=[],
+                cursor=cursor,
+                has_more=False,
+                primary_count=0,
+                rate_limit=self.rate_limit,
+            )
+
+        try:
+            feed_title, entries = self._parse_feed(response.content)
+        except (ET.ParseError, ValueError) as exc:
+            raise CollectorError(
+                f"failed to parse feed {self.url}: {exc}",
+                kind=CollectorErrorKind.PARSE,
+                source_key=self.identity.key,
+                retryable=False,
+            ) from exc
+
+        selected_entries = entries[offset : offset + ctx.limit]
         events: list[SignalEvent] = []
-        for entry in entries[:limit]:
-            link = entry["link"] or self.url
-            title = html_to_text(entry["title"]) or None
-            content = html_to_text(entry["content"] or entry["title"])
-            external_id = entry["id"] or link or title or str(len(events))
+        for entry in selected_entries:
+            link = str(entry["link"] or self.url)
+            title = html_to_text(str(entry["title"] or "")) or None
+            content = html_to_text(str(entry["content"] or entry["title"] or ""))
+            external_id = str(entry["id"] or link or title or len(events))
+            created_at = self._parse_time(entry["published"])
+            updated_at = self._parse_optional_time(entry["updated"])
             events.append(
                 SignalEvent(
-                    id=SignalEvent.stable_id(self.source, external_id, SignalKind.ARTICLE),
+                    id=SignalEvent.stable_id(
+                        self.source,
+                        external_id,
+                        SignalKind.ARTICLE,
+                        source_instance=self.instance,
+                    ),
                     source=self.source,
+                    source_instance=self.instance,
                     kind=SignalKind.ARTICLE,
                     title=title,
                     content=content,
-                    author=entry["author"] or None,
+                    author=str(entry["author"] or "") or None,
                     url=link,
-                    created_at=self._parse_time(entry["published"]),
+                    created_at=created_at,
+                    updated_at=updated_at,
                     metadata={
                         "feed_url": self.url,
                         "feed_title": feed_title,
@@ -59,7 +102,25 @@ class RSSCollector(HTTPCollector):
                     },
                 )
             )
-        return events
+
+        next_offset = offset + len(selected_entries)
+        has_more = next_offset < len(entries)
+        next_cursor = Cursor(
+            source_key=self.identity.key,
+            state={
+                "etag": response.headers.get("ETag"),
+                "last_modified": response.headers.get("Last-Modified"),
+                "fetched_at": datetime.now(UTC).isoformat(),
+                "offset": next_offset if has_more else 0,
+            },
+        )
+        return CollectorResult(
+            events=events,
+            cursor=next_cursor,
+            has_more=has_more,
+            primary_count=len(selected_entries),
+            rate_limit=self.rate_limit,
+        )
 
     @classmethod
     def _parse_feed(cls, payload: bytes) -> tuple[str | None, list[dict[str, object]]]:
@@ -95,6 +156,7 @@ class RSSCollector(HTTPCollector):
                     "content": content,
                     "author": author,
                     "published": cls._child_text(item, "pubDate"),
+                    "updated": cls._child_text(item, "updated"),
                     "tags": tags,
                 }
             )
@@ -135,13 +197,10 @@ class RSSCollector(HTTPCollector):
                     "id": cls._child_text(entry, "id") or link,
                     "title": cls._child_text(entry, "title"),
                     "link": link,
-                    "content": (
-                        cls._child_text(entry, "content") or cls._child_text(entry, "summary")
-                    ),
+                    "content": cls._child_text(entry, "content") or cls._child_text(entry, "summary"),
                     "author": author,
-                    "published": (
-                        cls._child_text(entry, "published") or cls._child_text(entry, "updated")
-                    ),
+                    "published": cls._child_text(entry, "published") or cls._child_text(entry, "updated"),
+                    "updated": cls._child_text(entry, "updated"),
                     "tags": tags,
                 }
             )
@@ -174,3 +233,9 @@ class RSSCollector(HTTPCollector):
             return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(UTC)
         except ValueError:
             return datetime.now(UTC)
+
+    @classmethod
+    def _parse_optional_time(cls, value: object) -> datetime | None:
+        if not value:
+            return None
+        return cls._parse_time(value)

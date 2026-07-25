@@ -52,6 +52,18 @@ class SourceHealth:
     total_events: int = 0
 
 
+@dataclass(slots=True, frozen=True)
+class DeliveryRecord:
+    sink_key: str
+    event_id: str
+    status: str
+    attempts: int
+    updated_at: datetime
+    next_attempt_at: datetime | None = None
+    last_error: str | None = None
+    delivered_at: datetime | None = None
+
+
 class SignalStore(Protocol):
     def write_many(self, events: Iterable[SignalEvent]) -> StoreWriteResult: ...
 
@@ -69,7 +81,7 @@ class SignalStore(Protocol):
 
 
 class SQLiteSignalStore:
-    """SQLite event store with upserts, checkpoints, and source health."""
+    """SQLite event store with checkpoints, source health, and transactional outbox."""
 
     def __init__(self, path: str | Path = "signals.db") -> None:
         self.path = Path(path)
@@ -118,6 +130,25 @@ class SQLiteSignalStore:
                 total_runs INTEGER NOT NULL DEFAULT 0,
                 total_events INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS delivery_sinks (
+                sink_key TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS deliveries (
+                sink_key TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT,
+                last_error TEXT,
+                delivered_at TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (sink_key, event_id)
+            );
             """
         )
         self._migrate_legacy_signals()
@@ -127,6 +158,47 @@ class SQLiteSignalStore:
                 ON signals(source, source_instance, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_signals_kind_created
                 ON signals(kind, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_deliveries_ready
+                ON deliveries(sink_key, status, next_attempt_at, updated_at);
+
+            CREATE TRIGGER IF NOT EXISTS trg_signals_delivery_insert
+            AFTER INSERT ON signals
+            BEGIN
+                INSERT INTO deliveries (
+                    sink_key, event_id, status, attempts, next_attempt_at,
+                    last_error, delivered_at, updated_at
+                )
+                SELECT sink_key, NEW.id, 'pending', 0, NULL, NULL, NULL, NEW.collected_at
+                FROM delivery_sinks
+                WHERE enabled = 1
+                ON CONFLICT(sink_key, event_id) DO UPDATE SET
+                    status = 'pending',
+                    attempts = 0,
+                    next_attempt_at = NULL,
+                    last_error = NULL,
+                    delivered_at = NULL,
+                    updated_at = excluded.updated_at;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_signals_delivery_update
+            AFTER UPDATE OF event_hash ON signals
+            WHEN OLD.event_hash != NEW.event_hash
+            BEGIN
+                INSERT INTO deliveries (
+                    sink_key, event_id, status, attempts, next_attempt_at,
+                    last_error, delivered_at, updated_at
+                )
+                SELECT sink_key, NEW.id, 'pending', 0, NULL, NULL, NULL, NEW.collected_at
+                FROM delivery_sinks
+                WHERE enabled = 1
+                ON CONFLICT(sink_key, event_id) DO UPDATE SET
+                    status = 'pending',
+                    attempts = 0,
+                    next_attempt_at = NULL,
+                    last_error = NULL,
+                    delivered_at = NULL,
+                    updated_at = excluded.updated_at;
+            END;
             """
         )
         self._connection.commit()
@@ -385,6 +457,155 @@ class SQLiteSignalStore:
         ).fetchall()
         return [self._row_to_health(row) for row in rows]
 
+    def register_delivery_sink(self, sink_key: str, *, backfill: bool = False) -> bool:
+        if not sink_key.strip():
+            raise ValueError("sink_key must not be empty")
+        now = datetime.now(UTC).isoformat()
+        with self._connection:
+            existing = self._connection.execute(
+                "SELECT 1 FROM delivery_sinks WHERE sink_key = ?",
+                (sink_key,),
+            ).fetchone()
+            self._connection.execute(
+                """
+                INSERT INTO delivery_sinks (sink_key, enabled, created_at, updated_at)
+                VALUES (?, 1, ?, ?)
+                ON CONFLICT(sink_key) DO UPDATE SET
+                    enabled = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (sink_key, now, now),
+            )
+            if backfill:
+                self._connection.execute(
+                    """
+                    INSERT INTO deliveries (
+                        sink_key, event_id, status, attempts, next_attempt_at,
+                        last_error, delivered_at, updated_at
+                    )
+                    SELECT ?, id, 'pending', 0, NULL, NULL, NULL, ? FROM signals WHERE 1
+                    ON CONFLICT(sink_key, event_id) DO NOTHING
+                    """,
+                    (sink_key, now),
+                )
+        return existing is None
+
+    def disable_delivery_sink(self, sink_key: str) -> None:
+        with self._connection:
+            self._connection.execute(
+                "UPDATE delivery_sinks SET enabled = 0, updated_at = ? WHERE sink_key = ?",
+                (datetime.now(UTC).isoformat(), sink_key),
+            )
+
+    def list_ready_deliveries(
+        self,
+        sink_key: str,
+        *,
+        limit: int = 100,
+        now: datetime | None = None,
+    ) -> list[DeliveryRecord]:
+        ready_at = (now or datetime.now(UTC)).isoformat()
+        rows = self._connection.execute(
+            """
+            SELECT * FROM deliveries
+            WHERE sink_key = ?
+              AND status IN ('pending', 'failed')
+              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+            ORDER BY updated_at, event_id
+            LIMIT ?
+            """,
+            (sink_key, ready_at, max(0, limit)),
+        ).fetchall()
+        return [self._row_to_delivery(row) for row in rows]
+
+    def mark_delivery_success(
+        self,
+        sink_key: str,
+        event_id: str,
+        *,
+        delivered_at: datetime | None = None,
+    ) -> None:
+        when = delivered_at or datetime.now(UTC)
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE deliveries SET
+                    status = 'delivered',
+                    attempts = attempts + 1,
+                    next_attempt_at = NULL,
+                    last_error = NULL,
+                    delivered_at = ?,
+                    updated_at = ?
+                WHERE sink_key = ? AND event_id = ?
+                """,
+                (when.isoformat(), when.isoformat(), sink_key, event_id),
+            )
+
+    def mark_delivery_failure(
+        self,
+        sink_key: str,
+        event_id: str,
+        *,
+        error: str,
+        next_attempt_at: datetime | None,
+        dead: bool = False,
+        attempted_at: datetime | None = None,
+    ) -> None:
+        when = attempted_at or datetime.now(UTC)
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE deliveries SET
+                    status = ?,
+                    attempts = attempts + 1,
+                    next_attempt_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE sink_key = ? AND event_id = ?
+                """,
+                (
+                    "dead" if dead else "failed",
+                    next_attempt_at.isoformat() if next_attempt_at and not dead else None,
+                    error,
+                    when.isoformat(),
+                    sink_key,
+                    event_id,
+                ),
+            )
+
+    def retry_dead_deliveries(self, sink_key: str) -> int:
+        now = datetime.now(UTC).isoformat()
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE deliveries SET
+                    status = 'pending', attempts = 0, next_attempt_at = NULL,
+                    last_error = NULL, delivered_at = NULL, updated_at = ?
+                WHERE sink_key = ? AND status = 'dead'
+                """,
+                (now, sink_key),
+            )
+        return int(cursor.rowcount)
+
+    def delivery_counts(self, sink_key: str | None = None) -> dict[str, int]:
+        if sink_key:
+            rows = self._connection.execute(
+                "SELECT status, COUNT(*) AS total FROM deliveries WHERE sink_key = ? GROUP BY status",
+                (sink_key,),
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                "SELECT status, COUNT(*) AS total FROM deliveries GROUP BY status"
+            ).fetchall()
+        return {str(row["status"]): int(row["total"]) for row in rows}
+
+    def get_delivery(self, sink_key: str, event_id: str) -> DeliveryRecord | None:
+        row = self._connection.execute(
+            "SELECT * FROM deliveries WHERE sink_key = ? AND event_id = ?",
+            (sink_key, event_id),
+        ).fetchone()
+        return self._row_to_delivery(row) if row is not None else None
+
     def get(self, event_id: str) -> SignalEvent | None:
         row = self._connection.execute(
             "SELECT * FROM signals WHERE id = ?",
@@ -476,6 +697,27 @@ class SQLiteSignalStore:
             consecutive_failures=int(row["consecutive_failures"]),
             total_runs=int(row["total_runs"]),
             total_events=int(row["total_events"]),
+        )
+
+    @staticmethod
+    def _row_to_delivery(row: sqlite3.Row) -> DeliveryRecord:
+        return DeliveryRecord(
+            sink_key=str(row["sink_key"]),
+            event_id=str(row["event_id"]),
+            status=str(row["status"]),
+            attempts=int(row["attempts"]),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            next_attempt_at=(
+                datetime.fromisoformat(str(row["next_attempt_at"]))
+                if row["next_attempt_at"]
+                else None
+            ),
+            last_error=str(row["last_error"]) if row["last_error"] else None,
+            delivered_at=(
+                datetime.fromisoformat(str(row["delivered_at"]))
+                if row["delivered_at"]
+                else None
+            ),
         )
 
     def close(self) -> None:

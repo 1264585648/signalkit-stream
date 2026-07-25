@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from signalkit_stream.collectors.base import Collector
-from signalkit_stream.config import RuntimeConfig, SourceConfig, StreamConfig
+from signalkit_stream.config import RuntimeConfig, SinkConfig, SourceConfig, StreamConfig
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import (
     CollectorError,
@@ -15,6 +15,7 @@ from signalkit_stream.protocol import (
 )
 from signalkit_stream.registry import CollectorRegistry
 from signalkit_stream.runtime import StreamRuntime
+from signalkit_stream.sinks import Sink, SinkRegistry
 from signalkit_stream.storage import SQLiteSignalStore
 
 
@@ -59,6 +60,15 @@ class FakeCollector(Collector):
         )
 
 
+class FakeSink(Sink):
+    def __init__(self, key: str, received: list[str]) -> None:
+        self.key = key
+        self.received = received
+
+    async def send(self, event: SignalEvent) -> None:
+        self.received.append(event.id)
+
+
 def registry_for(*, fail: bool = False, rate_limit=None) -> CollectorRegistry:
     registry = CollectorRegistry()
     registry.register(
@@ -68,7 +78,7 @@ def registry_for(*, fail: bool = False, rate_limit=None) -> CollectorRegistry:
     return registry
 
 
-def config_for(*, threshold: int = 2, interval: float = 60) -> StreamConfig:
+def config_for(*, threshold: int = 2, interval: float = 60, with_sink: bool = False) -> StreamConfig:
     return StreamConfig(
         runtime=RuntimeConfig(
             concurrency=2,
@@ -77,6 +87,7 @@ def config_for(*, threshold: int = 2, interval: float = 60) -> StreamConfig:
             failure_backoff_base=5,
         ),
         sources=(SourceConfig("one", "fake", interval=interval, limit=1),),
+        sinks=(SinkConfig("brain", "fake-sink"),) if with_sink else (),
     )
 
 
@@ -103,6 +114,28 @@ async def test_run_once_persists_events_health_and_resume(tmp_path) -> None:
         assert health.total_runs == 2
         assert health.total_events == 2
         assert health.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_run_once_collects_then_delivers_transactional_outbox(tmp_path) -> None:
+    received: list[str] = []
+    sink_registry = SinkRegistry()
+    sink_registry.register("fake-sink", lambda config: FakeSink(config.name, received))
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(
+            config_for(with_sink=True),
+            store,
+            registry=registry_for(),
+            sink_registry=sink_registry,
+        )
+        results = await runtime.run_once()
+        event_id = results[0].collection.events[0].id
+        delivery = store.get_delivery("brain", event_id)
+
+    assert received == [event_id]
+    assert runtime.last_delivery_results[0].delivered == 1
+    assert delivery.status == "delivered"
 
 
 @pytest.mark.asyncio

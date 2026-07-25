@@ -146,7 +146,7 @@ class StreamRuntime:
         )
 
     async def run_forever(self) -> None:
-        """Run all configured source workers until stop is requested or cancelled."""
+        """Run workers until stop, allowing a bounded graceful shutdown window."""
 
         workers = [
             asyncio.create_task(self._worker(name), name=f"signalkit:{name}")
@@ -154,16 +154,39 @@ class StreamRuntime:
         ]
         if not workers:
             return
+
+        stop_waiter = asyncio.create_task(self._stop_event.wait(), name="signalkit:stop")
+        worker_group = asyncio.gather(*workers)
         try:
-            await asyncio.gather(*workers)
+            done, _ = await asyncio.wait(
+                {worker_group, stop_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if worker_group in done:
+                await worker_group
+                return
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(worker_group),
+                    timeout=self.config.runtime.shutdown_timeout,
+                )
+            except TimeoutError:
+                for worker in workers:
+                    if not worker.done():
+                        worker.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
         except asyncio.CancelledError:
             self.request_stop()
             for worker in workers:
-                worker.cancel()
+                if not worker.done():
+                    worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
             raise
         finally:
             self.request_stop()
+            stop_waiter.cancel()
+            await asyncio.gather(stop_waiter, return_exceptions=True)
             for worker in workers:
                 if not worker.done():
                     worker.cancel()
@@ -249,6 +272,8 @@ class StreamRuntime:
         if rate_limit is None:
             return None
         if rate_limit.remaining is not None and rate_limit.remaining > 0:
+            return None
+        if rate_limit.remaining is None and rate_limit.retry_after is None:
             return None
         candidates: list[datetime] = []
         if rate_limit.reset_at is not None and rate_limit.reset_at > now:

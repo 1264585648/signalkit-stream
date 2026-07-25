@@ -1,33 +1,44 @@
 # SignalKit Stream
 
-SignalKit Stream is the ingestion boundary for SignalKit: a small, reliable framework that collects public signals from external sources, normalizes them into a versioned event contract, checkpoints progress, deduplicates source objects, and hands clean events to downstream analysis or automation systems.
+SignalKit Stream is the ingestion boundary for SignalKit: a reliable framework for continuously collecting public signals from external sources, normalizing them into a versioned event contract, checkpointing progress, persisting source health, and handing clean events to downstream analysis or automation systems.
 
 The module deliberately stops at ingestion. Intent classification, lead scoring, enrichment, CRM sync, outreach, and agent actions belong downstream.
 
 ## Architecture
 
 ```text
+TOML config
+    ↓
+Source registry / factories
+    ↓
+Runtime scheduler
+    ├─ global concurrency
+    ├─ provider concurrency
+    ├─ rate-limit pauses
+    ├─ failure backoff / circuit breaker
+    └─ graceful shutdown
+    ↓
+Collectors
 RSS / Hacker News / GitHub / future adapters
-                    ↓
-               Collectors
-                    ↓
-       CollectorResult + Cursor
-                    ↓
-              run_collector
-          retry / pagination / resume
-                    ↓
-        SignalEvent schema v1
-                    ↓
-      SQLite event + checkpoint store
-                    ↓
-       downstream sinks / consumers
+    ↓
+CollectorResult + Cursor
+    ↓
+run_collector
+retry / pagination / resume
+    ↓
+SignalEvent schema v1
+    ↓
+SQLite event + checkpoint store
+SQLite source-health store
+    ↓
+downstream sinks / consumers
 ```
 
 The important boundary is the `SignalEvent` contract. Downstream code should not need source-specific parsing logic.
 
-## Current core
+## Current module
 
-The current core includes:
+The current implementation includes:
 
 - versioned `SignalEvent` schema and deterministic IDs
 - `SourceIdentity`, `Cursor`, `CollectorContext`, `CollectorResult`, and stable collector errors
@@ -40,25 +51,25 @@ The current core includes:
 - RSS / Atom collection with conditional HTTP requests
 - Hacker News story and optional top-level comment collection
 - GitHub issue / pull-request search with optional comments and resumable pagination
-- CLI collection, event inspection, and checkpoint inspection
-- offline tests based on mocked transports
-- CI on Python 3.11, 3.12, and 3.13
+- strict TOML runtime configuration
+- source registry / collector factory
+- continuous scheduler with per-source polling intervals
+- global and provider-level concurrency limits
+- persisted rate-limit pauses and source health
+- failure backoff and circuit-breaker cooldown
+- bounded graceful shutdown
+- `signalkit run` continuous lifecycle command
+- deterministic offline tests and CI on Python 3.11, 3.12, and 3.13
 
-This is not intended as a throwaway MVP. The public contracts in this package are the foundation for the long-running runtime, sinks, and additional adapters documented in `docs/ROADMAP.md`.
+This is not a throwaway MVP. These contracts are the foundation of the complete Stream module documented in `docs/ROADMAP.md`.
 
 ## Reliability model
 
 SignalKit Stream uses **at-least-once collection + idempotent persistence**.
 
-For a persisted run, each collector page and its next cursor are committed in one SQLite transaction. If a process dies before that transaction, the same page can be collected again. If it dies after the transaction, the next run resumes from the stored cursor. Stable event IDs and fingerprints make repeated collection safe.
+For a persisted run, each collector page and its next cursor are committed in one SQLite transaction. If a process dies before that transaction, the page can be collected again. If it dies after the transaction, the next process resumes from the committed cursor. Stable event IDs and fingerprints make repeated collection safe.
 
-A checkpoint is scoped to a source instance such as:
-
-```text
-hackernews:newstories
-github:search-<query-hash>
-rss:https://example.com/feed.xml
-```
+Runtime source health is persisted separately, including last attempt, last success, failure count, pause deadline, and observed rate-limit state. A restart therefore preserves both collection progress and scheduler cooldown state.
 
 ## Install
 
@@ -94,7 +105,62 @@ For development:
 python -m pip install -e ".[dev]"
 ```
 
-## CLI
+## Continuous runtime
+
+Copy the example configuration:
+
+```bash
+cp examples/signalkit.toml signalkit.toml
+```
+
+Example:
+
+```toml
+[runtime]
+database = "signals.db"
+global_concurrency = 4
+provider_concurrency = 2
+shutdown_timeout = 15
+default_interval = 60
+failure_threshold = 3
+cooldown = 300
+
+[[sources]]
+name = "hn-ask"
+type = "hackernews"
+interval = 60
+limit = 50
+options = { feed = "askstories", comments = 3 }
+
+[[sources]]
+name = "github-demand"
+type = "github"
+interval = 120
+limit = 100
+options = { query = '"looking for" is:issue is:open', comments = 3, token_env = "GITHUB_TOKEN" }
+
+[[sources]]
+name = "hn-rss"
+type = "rss"
+interval = 60
+options = { url = "https://hnrss.org/newest" }
+```
+
+Run continuously:
+
+```bash
+signalkit run --config signalkit.toml
+```
+
+Run one scheduler cycle and exit, useful for smoke tests or cron:
+
+```bash
+signalkit run --config signalkit.toml --once
+```
+
+The runtime isolates sources: a failing collector does not stop healthy collectors. Exhausted rate limits and repeated failures create persisted pauses so the process does not busy-loop. SIGINT/SIGTERM requests a graceful stop; collectors get a bounded shutdown window before remaining worker tasks are cancelled.
+
+## One-shot CLI
 
 Collect an RSS/Atom feed:
 
@@ -149,7 +215,7 @@ signalkit collect rss https://example.com/feed.xml --no-store --format jsonl \
   "id": "sig_4a88d36e...",
   "schema_version": 1,
   "source": "github",
-  "source_instance": "search-67b7...",
+  "source_instance": "github-demand",
   "kind": "issue",
   "title": "Need webhook support",
   "content": "We are looking for webhook support.",
@@ -188,41 +254,6 @@ async def collect(
 
 See `docs/ARCHITECTURE.md` for invariants and `examples/custom_collector.py` for an adapter example.
 
-## Python API
-
-```python
-import asyncio
-
-from signalkit_stream.collectors import HackerNewsCollector
-from signalkit_stream.pipeline import run_collector
-from signalkit_stream.storage import SQLiteSignalStore
-
-
-async def main() -> None:
-    collector = HackerNewsCollector(
-        feed="askstories",
-        include_comments=True,
-        comments_per_story=3,
-    )
-
-    with SQLiteSignalStore("signals.db") as store:
-        result = await run_collector(
-            collector,
-            limit=50,
-            store=store,
-        )
-
-    print(
-        result.primary_count,
-        result.inserted,
-        result.updated,
-        result.unchanged,
-    )
-
-
-asyncio.run(main())
-```
-
 ## Development
 
 ```bash
@@ -238,7 +269,7 @@ pytest --cov=signalkit_stream --cov-report=term-missing --cov-fail-under=80
 python -m compileall -q src
 ```
 
-The normal test suite must not require external network access. Live API smoke tests, when added, will be kept separate from the deterministic CI gate.
+The normal test suite must not require external network access. Scheduler tests use a controllable clock rather than wall-clock sleeps.
 
 ## Source support
 
@@ -254,7 +285,9 @@ Prefer official APIs and feeds where available, and respect authentication, rate
 
 ## Roadmap
 
-The implementation order and release gates are maintained in `docs/ROADMAP.md`. The next layer is the long-running runtime: configuration, scheduler, source-aware throttling/circuit breaking, sinks, Reddit, health/metrics, and restart/end-to-end tests.
+The foundation and continuous runtime layers are implemented. The next major layer is delivery: sink protocol, stdout/JSONL, webhook delivery, fan-out, replay, and dead-letter persistence. Adapter completion and operational commands follow after the sink contract is stable.
+
+See `docs/ROADMAP.md` for release gates.
 
 ## License
 

@@ -4,12 +4,16 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import sys
 from collections.abc import Sequence
 
 from signalkit_stream.collectors import GitHubCollector, HackerNewsCollector, RSSCollector
+from signalkit_stream.config import ConfigError, load_config
+from signalkit_stream.health import SQLiteRuntimeStateStore
 from signalkit_stream.models import SignalEvent
 from signalkit_stream.pipeline import run_collector
+from signalkit_stream.runtime import SourceRunOutcome, StreamRuntime
 from signalkit_stream.storage import SQLiteSignalStore
 
 
@@ -67,6 +71,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     github.add_argument("--instance", help="Stable source instance name (default: query hash)")
     _add_collection_options(github)
+
+    run = subparsers.add_parser("run", help="Run configured sources continuously")
+    run.add_argument("--config", default="signalkit.toml", help="TOML config path")
+    run.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one scheduler cycle for all enabled sources and exit",
+    )
 
     show = subparsers.add_parser("show", help="Read normalized events from SQLite")
     show.add_argument("--db", default="signals.db")
@@ -165,6 +177,70 @@ async def _run_collect(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_runtime(args: argparse.Namespace) -> int:
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    database = config.runtime.database
+    with SQLiteSignalStore(database) as event_store, SQLiteRuntimeStateStore(database) as state_store:
+        try:
+            runtime = StreamRuntime(
+                config,
+                event_store=event_store,
+                state_store=state_store,
+            )
+        except ConfigError as exc:
+            print(f"configuration error: {exc}", file=sys.stderr)
+            return 2
+
+        if args.once:
+            outcomes = await runtime.run_once()
+            _print_runtime_outcomes(outcomes)
+            return 1 if any(outcome.error for outcome in outcomes) else 0
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, runtime.request_stop)
+            except (NotImplementedError, RuntimeError):
+                pass
+
+        print(
+            f"SignalKit Stream running {len(runtime.source_names)} source(s); db={database}",
+            file=sys.stderr,
+        )
+        await runtime.run_forever()
+        print("SignalKit Stream stopped.", file=sys.stderr)
+        return 0
+
+
+def _print_runtime_outcomes(outcomes: Sequence[SourceRunOutcome]) -> None:
+    for outcome in outcomes:
+        if outcome.skipped:
+            print(
+                f"{outcome.name}: skipped ({outcome.reason}); retry_in={outcome.next_delay:.1f}s",
+                file=sys.stderr,
+            )
+        elif outcome.error:
+            print(
+                f"{outcome.name}: error={outcome.error}; retry_in={outcome.next_delay:.1f}s",
+                file=sys.stderr,
+            )
+        elif outcome.result is not None:
+            result = outcome.result
+            print(
+                (
+                    f"{outcome.name}: primary={result.primary_count} events={len(result.events)} "
+                    f"inserted={result.inserted} updated={result.updated} "
+                    f"unchanged={result.unchanged}; next_in={outcome.next_delay:.1f}s"
+                ),
+                file=sys.stderr,
+            )
+
+
 def _run_show(args: argparse.Namespace) -> int:
     with SQLiteSignalStore(args.db) as store:
         events = store.list_recent(
@@ -205,6 +281,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "collect":
         return asyncio.run(_run_collect(args))
+    if args.command == "run":
+        return asyncio.run(_run_runtime(args))
     if args.command == "show":
         return _run_show(args)
     if args.command == "checkpoint":

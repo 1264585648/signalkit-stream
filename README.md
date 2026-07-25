@@ -1,8 +1,8 @@
 # SignalKit Stream
 
-SignalKit Stream is the ingestion boundary for SignalKit: a small, reliable framework that collects public signals from external sources, normalizes them into a versioned event contract, checkpoints progress, deduplicates source objects, and hands clean events to downstream analysis or automation systems.
+SignalKit Stream is the ingestion boundary for SignalKit: a reliable, pluggable service that continuously collects public signals from external sources, normalizes them into a versioned event contract, checkpoints progress, persists source mutations idempotently, and delivers events to downstream consumers through durable sinks.
 
-The module deliberately stops at ingestion. Intent classification, lead scoring, enrichment, CRM sync, outreach, and agent actions belong downstream.
+The module deliberately stops at ingestion and delivery. Intent classification, lead scoring, enrichment, CRM sync, outreach, and agent actions belong downstream.
 
 ## Architecture
 
@@ -11,54 +11,63 @@ RSS / Hacker News / GitHub / future adapters
                     ↓
                Collectors
                     ↓
-       CollectorResult + Cursor
+        CollectorResult + Cursor
                     ↓
-              run_collector
-          retry / pagination / resume
+              StreamRuntime
+     retry / pagination / scheduling
+      rate limits / source health
                     ↓
-        SignalEvent schema v1
+         SignalEvent schema v1
                     ↓
-      SQLite event + checkpoint store
+       SQLite transaction boundary
+        events + checkpoints + outbox
                     ↓
-       downstream sinks / consumers
+              DeliveryEngine
+          retry / dead letter / replay
+                    ↓
+      stdout / JSONL / webhook / future sinks
 ```
 
-The important boundary is the `SignalEvent` contract. Downstream code should not need source-specific parsing logic.
+The stable boundary is `SignalEvent`. Downstream consumers should not need source-specific parsing logic.
 
-## Current core
+## Implemented foundation
 
-The current core includes:
+SignalKit Stream currently includes:
 
-- versioned `SignalEvent` schema and deterministic IDs
+- versioned `SignalEvent` schema, deterministic source-object IDs, and mutation fingerprints
 - `SourceIdentity`, `Cursor`, `CollectorContext`, `CollectorResult`, and stable collector errors
 - pluggable async collector SDK
-- shared HTTP retry/backoff, timeout handling, and rate-limit inspection
-- resumable collection with pagination-loop protection
-- atomic SQLite event + checkpoint commits
-- idempotent inserts and source-object updates using content fingerprints
-- migration of databases created by the original 0.1 schema
-- RSS / Atom collection with conditional HTTP requests
-- Hacker News story and optional top-level comment collection
-- GitHub issue / pull-request search with optional comments and resumable pagination
-- CLI collection, event inspection, and checkpoint inspection
-- offline tests based on mocked transports
-- CI on Python 3.11, 3.12, and 3.13
+- shared HTTP timeout, retry/backoff, `Retry-After`, and rate-limit inspection
+- incremental/resumable collection with pagination-loop protection
+- RSS / Atom, Hacker News, and GitHub adapters
+- strict TOML runtime configuration and collector registry
+- long-running independent source workers with bounded global concurrency
+- source failure backoff, circuit-open cooldown, rate-limit-aware scheduling, and graceful shutdown
+- persisted source health across restarts
+- SQLite event store, legacy schema migration, and atomic event/checkpoint writes
+- transactional delivery outbox
+- stdout, JSONL, and webhook sinks
+- independent sink retries, dead letters, replay, and optional historical backfill
+- stable webhook idempotency keys
+- CLI lifecycle, health, checkpoint, and delivery operations
+- deterministic offline tests and CI on Python 3.11, 3.12, and 3.13
 
-This is not intended as a throwaway MVP. The public contracts in this package are the foundation for the long-running runtime, sinks, and additional adapters documented in `docs/ROADMAP.md`.
+This is not a throwaway MVP. The current public contracts are the foundation for the remaining adapter and operations work tracked in `docs/ROADMAP.md`.
 
 ## Reliability model
 
-SignalKit Stream uses **at-least-once collection + idempotent persistence**.
+Collection uses **at-least-once collection + idempotent persistence**. Each collector page and its next cursor are committed in one SQLite transaction. If the process dies before commit, the page can be collected again. If it dies after commit, the next run resumes from the stored cursor. Stable event IDs and content fingerprints make replay safe.
 
-For a persisted run, each collector page and its next cursor are committed in one SQLite transaction. If a process dies before that transaction, the same page can be collected again. If it dies after the transaction, the next run resumes from the stored cursor. Stable event IDs and fingerprints make repeated collection safe.
+Delivery uses a **transactional outbox + at-least-once delivery** model. When a new or changed signal is persisted, SQLite creates delivery records for enabled sinks in the same transaction. A sink failure does not move the source checkpoint backward and does not require recollecting the source. Retryable failures are scheduled with backoff; permanent or exhausted failures become dead letters and can be replayed.
 
-A checkpoint is scoped to a source instance such as:
+Webhook deliveries include:
 
 ```text
-hackernews:newstories
-github:search-<query-hash>
-rss:https://example.com/feed.xml
+Idempotency-Key: signalkit:<sink-key>:<event-id>
+X-SignalKit-Event-ID: <event-id>
 ```
+
+Consumers should use the idempotency key if their side effects are not naturally idempotent.
 
 ## Install
 
@@ -94,53 +103,115 @@ For development:
 python -m pip install -e ".[dev]"
 ```
 
-## CLI
+## Long-running runtime
 
-Collect an RSS/Atom feed:
+Create a configuration:
+
+```bash
+signalkit init
+```
+
+Example `signalkit.toml`:
+
+```toml
+[runtime]
+database = "signals.db"
+concurrency = 4
+failure_threshold = 5
+circuit_cooldown = 300
+delivery_interval = 1
+delivery_batch = 100
+delivery_max_attempts = 8
+
+[[sources]]
+name = "hn-ask"
+type = "hackernews"
+interval = 60
+limit = 50
+feed = "askstories"
+comments = 3
+
+[[sources]]
+name = "github-leads"
+type = "github"
+interval = 120
+limit = 50
+query = '"looking for" is:issue is:open'
+comments = 3
+token_env = "GITHUB_TOKEN"
+
+[[sinks]]
+name = "archive"
+type = "jsonl"
+path = "signals.jsonl"
+backfill = false
+
+[[sinks]]
+name = "brain"
+type = "webhook"
+url = "https://example.com/signals"
+token_env = "SIGNALKIT_WEBHOOK_TOKEN"
+backfill = false
+```
+
+Run continuously:
+
+```bash
+signalkit run signalkit.toml
+```
+
+Run one collection/delivery cycle:
+
+```bash
+signalkit run signalkit.toml --once
+```
+
+`backfill = true` queues existing stored signals for a sink as well as future new/changed events. Existing delivery records are preserved, so restarting with backfill enabled does not requeue already delivered rows.
+
+## One-shot collection
+
+The same collectors can be used without the scheduler.
 
 ```bash
 signalkit collect rss https://hnrss.org/newest --source hn-rss --limit 20
-```
-
-Collect Hacker News stories and comments:
-
-```bash
 signalkit collect hn --feed askstories --limit 20 --comments 3
-```
-
-Search GitHub issues / pull requests:
-
-```bash
 signalkit collect github '"looking for" is:issue is:open' --limit 50 --comments 3
 ```
 
-For higher GitHub API limits:
-
-```bash
-export GITHUB_TOKEN=github_pat_xxx
-```
-
-Repeated commands resume from the stored checkpoint. Use `--fresh` to ignore the checkpoint for one run while keeping event writes idempotent.
-
-Inspect events:
-
-```bash
-signalkit show --limit 20
-signalkit show --source github --kind issue --format jsonl
-```
-
-Inspect a checkpoint:
-
-```bash
-signalkit checkpoint hackernews:newstories
-```
+Repeated persisted commands resume from the stored checkpoint. Use `--fresh` to ignore the checkpoint for one run while keeping writes idempotent.
 
 Skip persistence and emit JSONL:
 
 ```bash
 signalkit collect rss https://example.com/feed.xml --no-store --format jsonl \
-  | your-intent-classifier
+  | your-consumer
 ```
+
+## Operations CLI
+
+Inspect events and source progress:
+
+```bash
+signalkit show --limit 20
+signalkit show --source github --kind issue --format jsonl
+signalkit checkpoint hackernews:newstories
+signalkit status
+```
+
+Inspect delivery state:
+
+```bash
+signalkit deliveries
+signalkit deliveries --sink brain --format json
+```
+
+Replay dead letters for one sink:
+
+```bash
+signalkit retry-deliveries brain
+```
+
+The next delivery worker cycle will attempt the replayed rows again.
 
 ## Event contract
 
@@ -170,7 +241,7 @@ Normalized kinds are `article`, `comment`, `issue`, `post`, `pull_request`, `sto
 
 ## Collector contract
 
-A collector owns exactly one logical source instance and returns a resumable batch:
+A collector owns one logical source instance and returns a resumable batch:
 
 ```python
 from signalkit_stream.protocol import CollectorContext, CollectorResult, Cursor
@@ -186,38 +257,39 @@ async def collect(
 
 `CollectorResult` carries normalized events, the next cursor, whether more data is immediately available, primary-item count, warnings, and source rate-limit information.
 
-See `docs/ARCHITECTURE.md` for invariants and `examples/custom_collector.py` for an adapter example.
+## Sink contract
+
+A sink receives normalized events after they have been committed to the event store and outbox:
+
+```python
+from signalkit_stream.models import SignalEvent
+from signalkit_stream.sinks import Sink
+
+
+class MySink(Sink):
+    key = "my-sink"
+
+    async def send(self, event: SignalEvent) -> None:
+        ...
+```
+
+Raise `SinkError` to describe retryability, status codes, or a source-provided retry delay. Delivery state is managed by `DeliveryEngine`, not by the sink implementation.
 
 ## Python API
 
 ```python
 import asyncio
 
-from signalkit_stream.collectors import HackerNewsCollector
-from signalkit_stream.pipeline import run_collector
+from signalkit_stream.config import load_config
+from signalkit_stream.runtime import StreamRuntime
 from signalkit_stream.storage import SQLiteSignalStore
 
 
 async def main() -> None:
-    collector = HackerNewsCollector(
-        feed="askstories",
-        include_comments=True,
-        comments_per_story=3,
-    )
-
-    with SQLiteSignalStore("signals.db") as store:
-        result = await run_collector(
-            collector,
-            limit=50,
-            store=store,
-        )
-
-    print(
-        result.primary_count,
-        result.inserted,
-        result.updated,
-        result.unchanged,
-    )
+    config = load_config("signalkit.toml")
+    with SQLiteSignalStore(config.runtime.database) as store:
+        runtime = StreamRuntime(config, store)
+        await runtime.run_forever()
 
 
 asyncio.run(main())
@@ -230,7 +302,7 @@ make install
 make check
 ```
 
-Or:
+Equivalent checks:
 
 ```bash
 ruff check .
@@ -238,7 +310,7 @@ pytest --cov=signalkit_stream --cov-report=term-missing --cov-fail-under=80
 python -m compileall -q src
 ```
 
-The normal test suite must not require external network access. Live API smoke tests, when added, will be kept separate from the deterministic CI gate.
+The normal test suite does not depend on third-party network availability. Public API behavior is simulated with mocked HTTP transports; live compatibility tests remain separate from the deterministic release gate.
 
 ## Source support
 
@@ -247,14 +319,14 @@ The normal test suite must not require external network access. Live API smoke t
 | RSS / Atom | entries | feed-dependent | ETag / Last-Modified + cursor | no |
 | Hacker News | stories | top-level comments | bounded seen-ID cursor | no |
 | GitHub | issues / PRs | issue / PR comments | page/offset + update watermark | optional token |
-| Reddit | planned adapter | planned | planned | app credentials |
-| Generic JSON Feed / REST | planned | adapter-dependent | planned | adapter-dependent |
+| Reddit | planned first-party adapter | planned | planned | app credentials |
+| JSON Feed / generic REST | planned extension path | adapter-dependent | planned | adapter-dependent |
 
 Prefer official APIs and feeds where available, and respect authentication, rate limits, robots rules, and source terms.
 
 ## Roadmap
 
-The implementation order and release gates are maintained in `docs/ROADMAP.md`. The next layer is the long-running runtime: configuration, scheduler, source-aware throttling/circuit breaking, sinks, Reddit, health/metrics, and restart/end-to-end tests.
+`docs/ROADMAP.md` contains the remaining work and release gates. Runtime scheduling and durable sink delivery are now implemented; the next major work is first-party adapter completion, operational diagnostics/metrics, explicit migration tooling, and restart/live compatibility test suites.
 
 ## License
 

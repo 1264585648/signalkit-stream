@@ -59,3 +59,40 @@ def test_init_and_status_commands(tmp_path, capsys) -> None:
     output = capsys.readouterr().out
     assert '"source_key": "hackernews:newstories"' in output
     assert '"status": "healthy"' in output
+
+
+def test_delivery_status_and_dead_letter_replay_commands(tmp_path, capsys) -> None:
+    database = tmp_path / "signals.db"
+    event = SignalEvent(
+        id="sig_delivery_cli",
+        source="test",
+        kind=SignalKind.POST,
+        content="Body",
+        url="https://example.com/delivery",
+        created_at=datetime(2026, 7, 25, tzinfo=UTC),
+    )
+    now = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+    with SQLiteSignalStore(database) as store:
+        store.register_delivery_sink("brain")
+        store.write_many([event])
+        store.mark_delivery_failure(
+            "brain",
+            event.id,
+            error="permanent",
+            next_attempt_at=None,
+            dead=True,
+            attempted_at=now,
+        )
+
+    assert main(
+        ["deliveries", "--db", str(database), "--sink", "brain", "--format", "json"]
+    ) == 0
+    status_output = capsys.readouterr().out
+    assert '"dead": 1' in status_output
+
+    assert main(["retry-deliveries", "brain", "--db", str(database)]) == 0
+    retry_output = capsys.readouterr().out
+    assert "Queued 1 dead deliveries" in retry_output
+
+    with SQLiteSignalStore(database) as store:
+        assert store.delivery_counts("brain") == {"pending": 1}

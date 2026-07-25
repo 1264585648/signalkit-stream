@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signalkit-stream"
+version = "0.1.0"
+description = "A pluggable public-signal ingestion layer for AI agents and lead intelligence workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "SignalKit contributors" }
+]
+keywords = [
+  "ai-agent",
+  "data-ingestion",
+  "lead-generation",
+  "rss",
+  "hacker-news",
+  "github",
+  "osint",
+  "social-listening",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "httpx>=0.27,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2,<9",
+  "pytest-asyncio>=0.23,<1",
+  "pytest-cov>=5,<7",
+  "ruff>=0.6,<1",
+]
+
+[project.scripts]
+signalkit = "signalkit_stream.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/1264585648/signalkit-stream"
+Repository = "https://github.com/1264585648/signalkit-stream"
+Issues = "https://github.com/1264585648/signalkit-stream/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]

@@ -50,9 +50,10 @@ class JSONFeedCollector(HTTPCollector):
         ctx = self.context(context)
         self.validate_cursor(cursor)
         state = dict(cursor.state) if cursor else {}
-        next_url = _optional_text(state.get("next_url"))
-        request_url = next_url or self.url
-        starting_new_cycle = next_url is None
+        page_url = _optional_text(state.get("page_url"))
+        item_offset = max(0, int(state.get("item_offset", 0))) if page_url else 0
+        request_url = page_url or self.url
+        starting_new_cycle = page_url is None
         prior_seen = [str(value) for value in state.get("seen_ids", []) if str(value)]
         prior_seen_set = set(prior_seen)
         watermark_ids = (
@@ -84,7 +85,8 @@ class JSONFeedCollector(HTTPCollector):
                 cursor=Cursor(
                     self.identity.key,
                     {
-                        "next_url": None,
+                        "page_url": None,
+                        "item_offset": 0,
                         "seen_ids": prior_seen,
                         "etag": state.get("etag"),
                         "last_modified": state.get("last_modified"),
@@ -102,6 +104,14 @@ class JSONFeedCollector(HTTPCollector):
         raw_items = payload.get("items")
         if not isinstance(raw_items, list):
             raise self._parse_error("JSON Feed items must be a list")
+        if item_offset > len(raw_items):
+            raise CollectorError(
+                "JSON Feed cursor item_offset is beyond the current page",
+                kind=CollectorErrorKind.CURSOR,
+                source_key=self.identity.key,
+                retryable=False,
+                details={"page_url": request_url, "item_offset": item_offset},
+            )
 
         feed_title = _optional_text(payload.get("title"))
         feed_home = _optional_text(payload.get("home_page_url"))
@@ -110,8 +120,11 @@ class JSONFeedCollector(HTTPCollector):
         primary_count = 0
         warnings: list[str] = []
         reached_watermark = False
+        next_offset = item_offset
 
-        for raw_item in raw_items:
+        for index in range(item_offset, len(raw_items)):
+            raw_item = raw_items[index]
+            next_offset = index + 1
             if not isinstance(raw_item, Mapping):
                 warnings.append("ignored malformed JSON Feed item")
                 continue
@@ -124,49 +137,44 @@ class JSONFeedCollector(HTTPCollector):
                 break
 
             primary_count += 1
-            if external_id in prior_seen_set:
-                continue
-            events.append(
-                self._item_event(
-                    raw_item,
-                    external_id=external_id,
-                    feed_title=feed_title,
-                    feed_home=feed_home,
+            if external_id not in prior_seen_set:
+                events.append(
+                    self._item_event(
+                        raw_item,
+                        external_id=external_id,
+                        feed_title=feed_title,
+                        feed_home=feed_home,
+                    )
                 )
-            )
-            processed_ids.append(external_id)
+                processed_ids.append(external_id)
             if primary_count >= ctx.limit:
                 break
 
         response_next_url = _optional_text(payload.get("next_url"))
-        page_exhausted = primary_count < ctx.limit or primary_count >= len(raw_items)
         if reached_watermark:
-            cursor_next_url = None
-        elif page_exhausted:
-            cursor_next_url = response_next_url
+            cursor_page_url = None
+            cursor_offset = 0
+        elif next_offset < len(raw_items):
+            cursor_page_url = request_url
+            cursor_offset = next_offset
+        elif response_next_url:
+            cursor_page_url = response_next_url
+            cursor_offset = 0
         else:
-            # JSON Feed has no item-offset cursor within a page. Requesting fewer items
-            # than the document contains would make a partial page non-resumable, so we
-            # treat the current document as the batch boundary and warn instead of
-            # pretending ``next_url`` can resume inside this page.
-            cursor_next_url = None
-            warnings.append(
-                "JSON Feed page contained more items than the requested batch; remaining items "
-                "on this page are not addressable by next_url"
-            )
+            cursor_page_url = None
+            cursor_offset = 0
 
-        has_more = cursor_next_url is not None
+        has_more = cursor_page_url is not None
         merged_seen = self._merge_seen(
             prior_seen,
             processed_ids,
             prepend=starting_new_cycle,
         )
         next_state: dict[str, Any] = {
-            "next_url": cursor_next_url,
+            "page_url": cursor_page_url,
+            "item_offset": cursor_offset,
             "seen_ids": merged_seen,
-            "etag": (
-                response.headers.get("ETag") if starting_new_cycle else state.get("etag")
-            ),
+            "etag": response.headers.get("ETag") if starting_new_cycle else state.get("etag"),
             "last_modified": (
                 response.headers.get("Last-Modified")
                 if starting_new_cycle

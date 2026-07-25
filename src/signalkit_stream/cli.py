@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Sequence
 import json
 import logging
 import os
 from pathlib import Path
 import signal
 import sys
-from collections.abc import Sequence
 
 from signalkit_stream.collectors import GitHubCollector, HackerNewsCollector, RSSCollector
 from signalkit_stream.config import load_config, sample_config
@@ -77,9 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("path", nargs="?", default="signalkit.toml")
     init.add_argument("--force", action="store_true", help="Overwrite an existing file")
 
-    run = subparsers.add_parser("run", help="Run configured source workers")
+    run = subparsers.add_parser("run", help="Run configured source and sink workers")
     run.add_argument("config", nargs="?", default="signalkit.toml")
-    run.add_argument("--once", action="store_true", help="Run each enabled source once and exit")
+    run.add_argument("--once", action="store_true", help="Run one collection/delivery cycle and exit")
     run.add_argument("--verbose", action="store_true")
 
     show = subparsers.add_parser("show", help="Read normalized events from SQLite")
@@ -97,6 +97,18 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="Inspect persisted runtime source health")
     status.add_argument("--db", default="signals.db")
     status.add_argument("--format", choices=["json", "table"], default="table")
+
+    deliveries = subparsers.add_parser("deliveries", help="Inspect durable delivery state")
+    deliveries.add_argument("--db", default="signals.db")
+    deliveries.add_argument("--sink", help="Limit counts to one sink key")
+    deliveries.add_argument("--format", choices=["json", "table"], default="table")
+
+    retry_deliveries = subparsers.add_parser(
+        "retry-deliveries",
+        help="Replay dead-letter deliveries for one sink",
+    )
+    retry_deliveries.add_argument("sink_key")
+    retry_deliveries.add_argument("--db", default="signals.db")
 
     return parser
 
@@ -142,8 +154,12 @@ def _format_health(items: Sequence[SourceHealth], output_format: str) -> str:
                     "source_key": item.source_key,
                     "status": item.status,
                     "updated_at": item.updated_at.isoformat(),
-                    "last_attempt_at": item.last_attempt_at.isoformat() if item.last_attempt_at else None,
-                    "last_success_at": item.last_success_at.isoformat() if item.last_success_at else None,
+                    "last_attempt_at": (
+                        item.last_attempt_at.isoformat() if item.last_attempt_at else None
+                    ),
+                    "last_success_at": (
+                        item.last_success_at.isoformat() if item.last_success_at else None
+                    ),
                     "last_error": item.last_error,
                     "consecutive_failures": item.consecutive_failures,
                     "total_runs": item.total_runs,
@@ -164,6 +180,28 @@ def _format_health(items: Sequence[SourceHealth], output_format: str) -> str:
             f"{item.source_key[:32]:32} {item.status[:14]:14} "
             f"{item.consecutive_failures:<7} {item.total_runs:<7} {item.total_events:<8} {success}"
         )
+    return "\n".join(lines)
+
+
+def _format_delivery_counts(
+    counts: dict[str, int],
+    *,
+    sink_key: str | None,
+    output_format: str,
+) -> str:
+    payload = {
+        "sink_key": sink_key,
+        "counts": counts,
+        "total": sum(counts.values()),
+    }
+    if output_format == "json":
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    if not counts:
+        return f"No deliveries{f' for {sink_key}' if sink_key else ''}."
+    lines = [f"Delivery state{f' for {sink_key}' if sink_key else ''}"]
+    for status, total in sorted(counts.items()):
+        lines.append(f"{status:12} {total}")
+    lines.append(f"{'total':12} {sum(counts.values())}")
     return "\n".join(lines)
 
 
@@ -241,6 +279,7 @@ async def _run_runtime(args: argparse.Namespace) -> int:
                 print(
                     json.dumps(
                         {
+                            "type": "source",
                             "name": result.name,
                             "source_key": result.source_key,
                             "success": result.success,
@@ -252,7 +291,25 @@ async def _run_runtime(args: argparse.Namespace) -> int:
                         ensure_ascii=False,
                     )
                 )
-            return 0 if all(result.success for result in results) else 1
+            for result in runtime.last_delivery_results:
+                print(
+                    json.dumps(
+                        {
+                            "type": "delivery",
+                            "sink_key": result.sink_key,
+                            "attempted": result.attempted,
+                            "delivered": result.delivered,
+                            "failed": result.failed,
+                            "dead": result.dead,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            source_success = all(result.success for result in results)
+            delivery_success = all(
+                result.failed == 0 and result.dead == 0 for result in runtime.last_delivery_results
+            )
+            return 0 if source_success and delivery_success else 1
 
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -314,6 +371,20 @@ def _run_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_deliveries(args: argparse.Namespace) -> int:
+    with SQLiteSignalStore(args.db) as store:
+        counts = store.delivery_counts(args.sink)
+    print(_format_delivery_counts(counts, sink_key=args.sink, output_format=args.format))
+    return 0
+
+
+def _run_retry_deliveries(args: argparse.Namespace) -> int:
+    with SQLiteSignalStore(args.db) as store:
+        retried = store.retry_dead_deliveries(args.sink_key)
+    print(f"Queued {retried} dead deliveries for retry on {args.sink_key}.")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "collect":
@@ -328,6 +399,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_checkpoint(args)
     if args.command == "status":
         return _run_status(args)
+    if args.command == "deliveries":
+        return _run_deliveries(args)
+    if args.command == "retry-deliveries":
+        return _run_retry_deliveries(args)
     return 2
 
 

@@ -13,6 +13,11 @@ class RuntimeConfig:
     failure_threshold: int = 5
     circuit_cooldown: float = 300.0
     failure_backoff_base: float = 5.0
+    delivery_interval: float = 1.0
+    delivery_batch: int = 100
+    delivery_max_attempts: int = 8
+    delivery_backoff_base: float = 5.0
+    delivery_backoff_max: float = 3600.0
 
     def __post_init__(self) -> None:
         if not self.database.strip():
@@ -25,6 +30,16 @@ class RuntimeConfig:
             raise ValueError("runtime.circuit_cooldown must be > 0")
         if self.failure_backoff_base <= 0:
             raise ValueError("runtime.failure_backoff_base must be > 0")
+        if self.delivery_interval <= 0:
+            raise ValueError("runtime.delivery_interval must be > 0")
+        if self.delivery_batch < 1:
+            raise ValueError("runtime.delivery_batch must be >= 1")
+        if self.delivery_max_attempts < 1:
+            raise ValueError("runtime.delivery_max_attempts must be >= 1")
+        if self.delivery_backoff_base <= 0 or self.delivery_backoff_max <= 0:
+            raise ValueError("runtime delivery backoff values must be > 0")
+        if self.delivery_backoff_max < self.delivery_backoff_base:
+            raise ValueError("runtime.delivery_backoff_max must be >= delivery_backoff_base")
 
 
 @dataclass(slots=True, frozen=True)
@@ -48,17 +63,37 @@ class SourceConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class SinkConfig:
+    name: str
+    type: str
+    enabled: bool = True
+    options: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("sink.name must not be empty")
+        if not self.type.strip():
+            raise ValueError(f"sink {self.name!r}: type must not be empty")
+
+
+@dataclass(slots=True, frozen=True)
 class StreamConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     sources: tuple[SourceConfig, ...] = ()
+    sinks: tuple[SinkConfig, ...] = ()
 
     def __post_init__(self) -> None:
-        names = [source.name for source in self.sources]
-        duplicates = sorted({name for name in names if names.count(name) > 1})
-        if duplicates:
-            raise ValueError(f"duplicate source names: {', '.join(duplicates)}")
+        source_names = [source.name for source in self.sources]
+        duplicate_sources = sorted({name for name in source_names if source_names.count(name) > 1})
+        if duplicate_sources:
+            raise ValueError(f"duplicate source names: {', '.join(duplicate_sources)}")
         if not any(source.enabled for source in self.sources):
             raise ValueError("configuration must contain at least one enabled source")
+
+        sink_names = [sink.name for sink in self.sinks]
+        duplicate_sinks = sorted({name for name in sink_names if sink_names.count(name) > 1})
+        if duplicate_sinks:
+            raise ValueError(f"duplicate sink names: {', '.join(duplicate_sinks)}")
 
 
 _RUNTIME_KEYS = {
@@ -67,8 +102,14 @@ _RUNTIME_KEYS = {
     "failure_threshold",
     "circuit_cooldown",
     "failure_backoff_base",
+    "delivery_interval",
+    "delivery_batch",
+    "delivery_max_attempts",
+    "delivery_backoff_base",
+    "delivery_backoff_max",
 }
 _SOURCE_KEYS = {"name", "type", "interval", "limit", "enabled"}
+_SINK_KEYS = {"name", "type", "enabled"}
 
 
 def load_config(path: str | Path) -> StreamConfig:
@@ -79,7 +120,7 @@ def load_config(path: str | Path) -> StreamConfig:
 
 
 def parse_config(payload: Mapping[str, Any]) -> StreamConfig:
-    unknown_top = set(payload) - {"runtime", "sources"}
+    unknown_top = set(payload) - {"runtime", "sources", "sinks"}
     if unknown_top:
         raise ValueError(f"unknown top-level configuration keys: {', '.join(sorted(unknown_top))}")
 
@@ -104,12 +145,31 @@ def parse_config(payload: Mapping[str, Any]) -> StreamConfig:
             runtime_payload.get("failure_backoff_base", 5.0),
             "runtime.failure_backoff_base",
         ),
+        delivery_interval=_float(
+            runtime_payload.get("delivery_interval", 1.0),
+            "runtime.delivery_interval",
+        ),
+        delivery_batch=_int(
+            runtime_payload.get("delivery_batch", 100),
+            "runtime.delivery_batch",
+        ),
+        delivery_max_attempts=_int(
+            runtime_payload.get("delivery_max_attempts", 8),
+            "runtime.delivery_max_attempts",
+        ),
+        delivery_backoff_base=_float(
+            runtime_payload.get("delivery_backoff_base", 5.0),
+            "runtime.delivery_backoff_base",
+        ),
+        delivery_backoff_max=_float(
+            runtime_payload.get("delivery_backoff_max", 3600.0),
+            "runtime.delivery_backoff_max",
+        ),
     )
 
     source_payloads = payload.get("sources", [])
     if not isinstance(source_payloads, list):
         raise ValueError("sources must be an array of TOML tables")
-
     sources: list[SourceConfig] = []
     for index, raw in enumerate(source_payloads):
         if not isinstance(raw, Mapping):
@@ -128,7 +188,26 @@ def parse_config(payload: Mapping[str, Any]) -> StreamConfig:
             )
         )
 
-    return StreamConfig(runtime=runtime, sources=tuple(sources))
+    sink_payloads = payload.get("sinks", [])
+    if not isinstance(sink_payloads, list):
+        raise ValueError("sinks must be an array of TOML tables")
+    sinks: list[SinkConfig] = []
+    for index, raw in enumerate(sink_payloads):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"sinks[{index}] must be a TOML table")
+        name = str(raw.get("name", "")).strip()
+        sink_type = str(raw.get("type", "")).strip()
+        options = {key: value for key, value in raw.items() if key not in _SINK_KEYS}
+        sinks.append(
+            SinkConfig(
+                name=name,
+                type=sink_type,
+                enabled=_bool(raw.get("enabled", True), f"sink {name!r}.enabled"),
+                options=options,
+            )
+        )
+
+    return StreamConfig(runtime=runtime, sources=tuple(sources), sinks=tuple(sinks))
 
 
 def sample_config() -> str:
@@ -138,6 +217,11 @@ concurrency = 4
 failure_threshold = 5
 circuit_cooldown = 300
 failure_backoff_base = 5
+delivery_interval = 1
+delivery_batch = 100
+delivery_max_attempts = 8
+delivery_backoff_base = 5
+delivery_backoff_max = 3600
 
 [[sources]]
 name = "hackernews-new"
@@ -162,6 +246,17 @@ comments = 0
 # interval = 300
 # limit = 100
 # url = "https://example.com/feed.xml"
+
+# [[sinks]]
+# name = "archive"
+# type = "jsonl"
+# path = "signals.jsonl"
+
+# [[sinks]]
+# name = "brain-webhook"
+# type = "webhook"
+# url = "https://example.com/signals"
+# token_env = "SIGNALKIT_WEBHOOK_TOKEN"
 '''
 
 

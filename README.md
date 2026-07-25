@@ -48,7 +48,7 @@ SignalKit Stream currently includes:
 - transactional delivery outbox
 - stdout, JSONL, and webhook sinks
 - independent sink retries, dead letters, replay, and optional historical backfill
-- stable webhook idempotency keys
+- event-version-aware webhook idempotency keys and in-flight mutation protection
 - CLI lifecycle, health, checkpoint, and delivery operations
 - deterministic offline tests and CI on Python 3.11, 3.12, and 3.13
 
@@ -60,14 +60,17 @@ Collection uses **at-least-once collection + idempotent persistence**. Each coll
 
 Delivery uses a **transactional outbox + at-least-once delivery** model. When a new or changed signal is persisted, SQLite creates delivery records for enabled sinks in the same transaction. A sink failure does not move the source checkpoint backward and does not require recollecting the source. Retryable failures are scheduled with backoff; permanent or exhausted failures become dead letters and can be replayed.
 
-Webhook deliveries include:
+Webhook deliveries include stable identifiers for the exact source-object version being sent:
 
 ```text
-Idempotency-Key: signalkit:<sink-key>:<event-id>
-X-SignalKit-Event-ID: <event-id>
+Idempotency-Key: signalkit:<version-digest>
+X-SignalKit-Event-ID: <stable-event-id>
+X-SignalKit-Event-Hash: <content-fingerprint>
 ```
 
-Consumers should use the idempotency key if their side effects are not naturally idempotent.
+The idempotency key is derived from the sink key, stable event ID, and event fingerprint. Retries of the same version therefore share a key, while a legitimate source update gets a new key. Consumers should honor the idempotency key if their side effects are not naturally idempotent.
+
+If a source object changes while an older payload is in flight, SignalKit Stream does not let success for the old payload overwrite the newer pending outbox state. The new version remains pending for a later delivery pass.
 
 ## Install
 

@@ -16,7 +16,7 @@ from signalkit_stream.storage import SQLiteSignalStore
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="signalkit",
-        description="Collect public web signals into one normalized event stream.",
+        description="Collect public web signals into one normalized, resumable event stream.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -26,6 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     rss = collectors.add_parser("rss", help="Collect an RSS/Atom feed")
     rss.add_argument("url")
     rss.add_argument("--source", default="rss", help="Logical source name stored on events")
+    rss.add_argument("--instance", help="Stable source instance name (default: feed URL)")
     _add_collection_options(rss)
 
     hn = collectors.add_parser("hn", help="Collect Hacker News")
@@ -64,14 +65,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="GITHUB_TOKEN",
         help="Environment variable containing a GitHub token (default: GITHUB_TOKEN)",
     )
+    github.add_argument("--instance", help="Stable source instance name (default: query hash)")
     _add_collection_options(github)
 
     show = subparsers.add_parser("show", help="Read normalized events from SQLite")
     show.add_argument("--db", default="signals.db")
     show.add_argument("--limit", type=int, default=20)
     show.add_argument("--source")
+    show.add_argument("--instance")
     show.add_argument("--kind")
     show.add_argument("--format", choices=["jsonl", "json", "table"], default="table")
+
+    checkpoint = subparsers.add_parser("checkpoint", help="Inspect a source checkpoint")
+    checkpoint.add_argument("source_key", help="Source key such as hackernews:newstories")
+    checkpoint.add_argument("--db", default="signals.db")
 
     return parser
 
@@ -79,7 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
 def _add_collection_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=20, help="Maximum primary items to collect")
     parser.add_argument("--db", default="signals.db", help="SQLite file (default: signals.db)")
-    parser.add_argument("--no-store", action="store_true", help="Do not persist events")
+    parser.add_argument("--no-store", action="store_true", help="Do not persist events/checkpoints")
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Ignore the stored checkpoint for this run (events remain idempotent)",
+    )
     parser.add_argument("--format", choices=["jsonl", "json", "table"], default="table")
 
 
@@ -91,15 +103,16 @@ def _format_events(events: Sequence[SignalEvent], output_format: str) -> str:
 
     if not events:
         return "No events."
-    lines = [f"{'SOURCE':14} {'KIND':14} {'AUTHOR':18} TITLE / CONTENT"]
-    lines.append("-" * 100)
+    lines = [f"{'SOURCE':22} {'KIND':14} {'AUTHOR':18} TITLE / CONTENT"]
+    lines.append("-" * 110)
     for event in events:
         preview = event.title or event.content or ""
         preview = " ".join(preview.split())
         if len(preview) > 48:
             preview = preview[:45] + "..."
         author = (event.author or "-")[:18]
-        lines.append(f"{event.source[:14]:14} {event.kind.value[:14]:14} {author:18} {preview}")
+        source = event.source_key[:22]
+        lines.append(f"{source:22} {event.kind.value[:14]:14} {author:18} {preview}")
     return "\n".join(lines)
 
 
@@ -108,7 +121,7 @@ async def _run_collect(args: argparse.Namespace) -> int:
         raise SystemExit("--limit must be >= 1")
 
     if args.collector == "rss":
-        collector = RSSCollector(args.url, source=args.source)
+        collector = RSSCollector(args.url, source=args.source, instance=args.instance)
     elif args.collector == "hn":
         collector = HackerNewsCollector(
             feed=args.feed,
@@ -121,6 +134,7 @@ async def _run_collect(args: argparse.Namespace) -> int:
             token=os.getenv(args.token_env),
             include_comments=args.comments > 0,
             comments_per_item=max(0, args.comments),
+            instance=args.instance,
         )
     else:  # pragma: no cover - argparse prevents this.
         raise SystemExit(f"unknown collector: {args.collector}")
@@ -129,24 +143,61 @@ async def _run_collect(args: argparse.Namespace) -> int:
         result = await run_collector(collector, limit=args.limit)
     else:
         with SQLiteSignalStore(args.db) as store:
-            result = await run_collector(collector, limit=args.limit, store=store)
+            result = await run_collector(
+                collector,
+                limit=args.limit,
+                store=store,
+                resume=not args.fresh,
+            )
 
     print(_format_events(result.events, args.format))
     if not args.no_store:
         print(
             (
-                f"Collected {len(result.events)} events; inserted {result.inserted} "
-                f"new events into {args.db}"
+                f"Collected {result.primary_count} primary items / {len(result.events)} events; "
+                f"inserted={result.inserted} updated={result.updated} unchanged={result.unchanged}; "
+                f"pages={result.pages}; db={args.db}"
             ),
             file=sys.stderr,
         )
+    for warning in result.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     return 0
 
 
 def _run_show(args: argparse.Namespace) -> int:
     with SQLiteSignalStore(args.db) as store:
-        events = store.list_recent(limit=args.limit, source=args.source, kind=args.kind)
+        events = store.list_recent(
+            limit=args.limit,
+            source=args.source,
+            source_instance=args.instance,
+            kind=args.kind,
+        )
     print(_format_events(events, args.format))
+    return 0
+
+
+def _run_checkpoint(args: argparse.Namespace) -> int:
+    with SQLiteSignalStore(args.db) as store:
+        checkpoint = store.get_checkpoint(args.source_key)
+    if checkpoint is None:
+        print("No checkpoint.")
+        return 1
+    print(
+        json.dumps(
+            {
+                "source_key": checkpoint.source_key,
+                "cursor": checkpoint.cursor.to_dict(),
+                "updated_at": checkpoint.updated_at.isoformat(),
+                "last_success_at": (
+                    checkpoint.last_success_at.isoformat() if checkpoint.last_success_at else None
+                ),
+                "last_error": checkpoint.last_error,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -156,6 +207,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_run_collect(args))
     if args.command == "show":
         return _run_show(args)
+    if args.command == "checkpoint":
+        return _run_checkpoint(args)
     return 2
 
 

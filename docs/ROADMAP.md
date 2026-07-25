@@ -4,7 +4,7 @@ This roadmap defines the boundary for the complete Stream module. Downstream LLM
 
 ## Foundation — implemented
 
-The current foundation establishes the contracts future runtime work will build on:
+The foundation establishes the contracts every runtime and adapter builds on:
 
 - versioned `SignalEvent` schema
 - deterministic source-object identity and mutation fingerprints
@@ -18,53 +18,59 @@ The current foundation establishes the contracts future runtime work will build 
 - offline HTTP simulation tests
 - legacy SQLite migration coverage
 
-## Runtime layer — next
+## Runtime layer — implemented
 
-Turn one-shot collection into a process that can run for days or weeks.
+The runtime turns one-shot collection into a process that can run for days or weeks.
 
-Implementation order:
+Implemented capabilities:
 
-1. TOML configuration and strict validation
+1. strict TOML configuration and validation
 2. source registry / adapter factory
 3. scheduler with per-source polling intervals
-4. bounded global and per-source concurrency
-5. graceful shutdown and task cancellation
-6. source-aware pause when rate limits are exhausted
-7. circuit breaker and cooldown after repeated failures
-8. persisted source health / last-attempt / last-success state
-9. `signalkit run` lifecycle command
+4. bounded global and provider-level concurrency
+5. graceful shutdown with a bounded completion window and task cancellation
+6. persisted source-aware pause when rate limits are exhausted
+7. failure backoff and circuit-breaker cooldown after repeated failures
+8. persisted source health, last-attempt, last-success, failure count, pause deadline, and rate-limit state
+9. `signalkit run` lifecycle command plus one-cycle smoke mode
+10. deterministic scheduler/restart tests with a controllable clock
 
-Release gate:
+Runtime release gate:
 
 - restart resumes from persisted checkpoints
-- SIGINT/SIGTERM cannot corrupt committed state
+- a source pause survives restart
 - a failing source does not stop healthy sources
 - rate-limited sources do not busy-loop
-- scheduler behavior is covered with a controllable clock, not wall-clock sleeps
+- repeated failures enter a persisted cooldown
+- scheduler timing can be tested without wall-clock sleeps
+- SIGINT/SIGTERM request bounded graceful shutdown before cancellation
 
-## Delivery layer
+## Delivery layer — next
 
-Separate collection from destinations with a `Sink` protocol.
+Separate collection from destinations with a `Sink` protocol and durable delivery state.
 
 First-party sinks:
 
 1. stdout / JSONL
-2. SQLite event store adapter
+2. SQLite event-store delivery adapter
 3. webhook sink with retry and idempotency key
 4. fan-out sink for multiple destinations
 5. failed-delivery / dead-letter persistence
+6. replay without recollecting upstream sources
 
 Release gate:
 
 - sink failure never advances delivery state incorrectly
 - a failed sink delivery can be replayed without recollecting the source
 - fan-out defines and tests partial-failure semantics
+- webhook retries preserve a stable idempotency key
+- delivery restart resumes from durable delivery state
 
 PostgreSQL, Redis Streams, and Kafka can be added later as optional integrations without making them core runtime dependencies.
 
 ## Adapter completion
 
-After the shared runtime contracts are stable, complete the first-party source set:
+After the shared runtime and delivery contracts are stable, complete the first-party source set:
 
 1. Reddit adapter using the official API and app credentials
    - posts
@@ -84,7 +90,7 @@ Every first-party adapter must pass the common collector contract suite plus sou
 Add the operational surface required to treat Stream as infrastructure:
 
 - structured logs
-- source health model
+- source health model exposed through CLI
 - collection and delivery metrics
 - configuration validation errors with actionable messages
 - credential diagnostics

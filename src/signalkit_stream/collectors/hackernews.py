@@ -36,6 +36,7 @@ class HackerNewsCollector(HTTPCollector):
         timeout: float = 20.0,
         retry_policy: RetryPolicy | None = None,
         seen_window: int = 500,
+        instance: str | None = None,
     ) -> None:
         super().__init__(client=client, timeout=timeout, retry_policy=retry_policy)
         self.feed = feed
@@ -43,7 +44,7 @@ class HackerNewsCollector(HTTPCollector):
         self.comments_per_story = max(0, comments_per_story)
         self.seen_window = max(50, seen_window)
         self.source = "hackernews"
-        self.instance = feed
+        self.instance = instance or feed
 
     async def collect(
         self,

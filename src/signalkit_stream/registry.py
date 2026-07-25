@@ -4,7 +4,14 @@ from collections.abc import Callable
 import os
 from typing import Any, Mapping
 
-from signalkit_stream.collectors import Collector, GitHubCollector, HackerNewsCollector, RSSCollector
+from signalkit_stream.collectors import (
+    Collector,
+    GitHubCollector,
+    HackerNewsCollector,
+    JSONFeedCollector,
+    RSSCollector,
+    RedditCollector,
+)
 from signalkit_stream.config import SourceConfig
 
 CollectorFactory = Callable[[SourceConfig], Collector]
@@ -39,8 +46,10 @@ class CollectorRegistry:
 def default_registry() -> CollectorRegistry:
     registry = CollectorRegistry()
     registry.register("rss", _rss_factory)
+    registry.register("jsonfeed", _jsonfeed_factory)
     registry.register("hackernews", _hackernews_factory)
     registry.register("github", _github_factory)
+    registry.register("reddit", _reddit_factory)
     return registry
 
 
@@ -52,6 +61,19 @@ def _rss_factory(config: SourceConfig) -> Collector:
         url,
         source=str(options.get("source", "rss")),
         instance=_optional_string(options.get("instance")),
+    )
+
+
+def _jsonfeed_factory(config: SourceConfig) -> Collector:
+    options = dict(config.options)
+    _reject_unknown(options, {"url", "source", "instance", "seen_window"}, config)
+    url = _required_string(options, "url", config)
+    seen_window = _positive_int(options.get("seen_window", 500), "seen_window", config)
+    return JSONFeedCollector(
+        url,
+        source=str(options.get("source", "jsonfeed")),
+        instance=_optional_string(options.get("instance")) or config.name,
+        seen_window=seen_window,
     )
 
 
@@ -96,6 +118,57 @@ def _github_factory(config: SourceConfig) -> Collector:
     )
 
 
+def _reddit_factory(config: SourceConfig) -> Collector:
+    options = dict(config.options)
+    _reject_unknown(
+        options,
+        {
+            "subreddit",
+            "listing",
+            "time_filter",
+            "comments",
+            "seen_window",
+            "instance",
+            "client_id_env",
+            "client_secret_env",
+            "user_agent_env",
+        },
+        config,
+    )
+    subreddit = _required_string(options, "subreddit", config)
+    listing = str(options.get("listing", "new")).strip().lower()
+    time_filter = _optional_string(options.get("time_filter"))
+    comments = _nonnegative_int(options.get("comments", 0), "comments", config)
+    seen_window = _positive_int(options.get("seen_window", 500), "seen_window", config)
+    client_id = _required_environment(
+        options.get("client_id_env", "REDDIT_CLIENT_ID"),
+        "client_id_env",
+        config,
+    )
+    client_secret = _required_environment(
+        options.get("client_secret_env", "REDDIT_CLIENT_SECRET"),
+        "client_secret_env",
+        config,
+    )
+    user_agent = _required_environment(
+        options.get("user_agent_env", "REDDIT_USER_AGENT"),
+        "user_agent_env",
+        config,
+    )
+    return RedditCollector(
+        subreddit,
+        client_id=client_id,
+        client_secret=client_secret,
+        user_agent=user_agent,
+        listing=listing,  # type: ignore[arg-type]
+        time_filter=time_filter,  # type: ignore[arg-type]
+        include_comments=comments > 0,
+        comments_per_post=comments,
+        seen_window=seen_window,
+        instance=_optional_string(options.get("instance")) or config.name,
+    )
+
+
 def _reject_unknown(options: Mapping[str, Any], allowed: set[str], config: SourceConfig) -> None:
     unknown = set(options) - allowed
     if unknown:
@@ -109,6 +182,18 @@ def _required_string(options: Mapping[str, Any], key: str, config: SourceConfig)
     if not value:
         raise ValueError(f"source {config.name!r}: {key} is required")
     return value
+
+
+def _required_environment(value: Any, key: str, config: SourceConfig) -> str:
+    env_name = str(value).strip()
+    if not env_name:
+        raise ValueError(f"source {config.name!r}: {key} must not be empty")
+    resolved = os.getenv(env_name)
+    if not resolved:
+        raise ValueError(
+            f"source {config.name!r}: environment variable {env_name!r} required by {key} is not set"
+        )
+    return resolved
 
 
 def _optional_string(value: Any) -> str | None:

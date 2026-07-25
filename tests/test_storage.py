@@ -3,7 +3,7 @@ import sqlite3
 
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import Cursor
-from signalkit_stream.storage import SQLiteSignalStore
+from signalkit_stream.storage import SQLiteSignalStore, SourceHealth
 
 
 def make_event(content: str = "A body", *, collected_day: int = 25) -> SignalEvent:
@@ -51,6 +51,25 @@ def test_batch_commits_checkpoint_with_events(tmp_path) -> None:
         assert checkpoint is not None
         assert checkpoint.cursor == cursor
         assert checkpoint.last_success_at is not None
+
+
+def test_source_health_round_trip(tmp_path) -> None:
+    now = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+    health = SourceHealth(
+        source_key="test:instance-a",
+        status="degraded",
+        updated_at=now,
+        last_attempt_at=now,
+        last_success_at=datetime(2026, 7, 25, 11, 0, tzinfo=UTC),
+        last_error="timeout",
+        consecutive_failures=2,
+        total_runs=7,
+        total_events=42,
+    )
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.upsert_source_health(health)
+        assert store.get_source_health(health.source_key) == health
+        assert store.list_source_health() == [health]
 
 
 def test_legacy_schema_is_migrated(tmp_path) -> None:

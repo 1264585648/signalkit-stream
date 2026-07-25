@@ -21,12 +21,29 @@ class RecordingSink(Sink):
         self.events.append(event.id)
 
 
-def event(event_id: str = "sig_delivery") -> SignalEvent:
+class MutatingSink(Sink):
+    """Simulate the source object changing while a downstream send is in flight."""
+
+    def __init__(self, key: str, store: SQLiteSignalStore) -> None:
+        self.key = key
+        self.store = store
+        self.payloads: list[str] = []
+        self.mutate_once = True
+
+    async def send(self, item: SignalEvent) -> None:
+        self.payloads.append(item.content)
+        if self.mutate_once:
+            self.mutate_once = False
+            self.store.write_many([event(content="newer")])
+        await asyncio.sleep(0)
+
+
+def event(event_id: str = "sig_delivery", *, content: str = "hello") -> SignalEvent:
     return SignalEvent(
         id=event_id,
         source="test",
         kind=SignalKind.POST,
-        content="hello",
+        content=content,
         url=f"https://example.com/{event_id}",
         created_at=datetime(2026, 7, 25, tzinfo=UTC),
     )
@@ -85,6 +102,29 @@ async def test_delivery_retries_then_dead_letters(tmp_path) -> None:
     assert second.dead == 1
     assert record.status == "dead"
     assert record.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_update_during_send_remains_pending_for_new_version(tmp_path) -> None:
+    now = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.register_delivery_sink("brain")
+        store.write_many([event(content="old")])
+        sink = MutatingSink("brain", store)
+        engine = DeliveryEngine(store, (sink,), now=lambda: now)
+
+        first = await engine.deliver_once(sink)
+        after_first = store.get_delivery("brain", "sig_delivery")
+        second = await engine.deliver_once(sink)
+        after_second = store.get_delivery("brain", "sig_delivery")
+
+    assert first.superseded == 1
+    assert first.delivered == 0
+    assert after_first.status == "pending"
+    assert after_first.attempts == 0
+    assert second.delivered == 1
+    assert after_second.status == "delivered"
+    assert sink.payloads == ["old", "newer"]
 
 
 @pytest.mark.asyncio

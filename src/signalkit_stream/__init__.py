@@ -7,6 +7,7 @@ from signalkit_stream.config import (
     StreamConfig,
     load_config,
 )
+from signalkit_stream.contracts import validate_collector_result
 from signalkit_stream.delivery import DeliveryEngine, DeliveryResult
 from signalkit_stream.models import SCHEMA_VERSION, SignalEvent, SignalKind
 from signalkit_stream.pipeline import CollectionResult, run_collector
@@ -65,6 +66,7 @@ __all__ = [
     "WebhookSink",
     "load_config",
     "run_collector",
+    "validate_collector_result",
 ]
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"

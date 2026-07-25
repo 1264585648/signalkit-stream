@@ -39,6 +39,19 @@ class Checkpoint:
     last_error: str | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class SourceHealth:
+    source_key: str
+    status: str
+    updated_at: datetime
+    last_attempt_at: datetime | None = None
+    last_success_at: datetime | None = None
+    last_error: str | None = None
+    consecutive_failures: int = 0
+    total_runs: int = 0
+    total_events: int = 0
+
+
 class SignalStore(Protocol):
     def write_many(self, events: Iterable[SignalEvent]) -> StoreWriteResult: ...
 
@@ -56,7 +69,7 @@ class SignalStore(Protocol):
 
 
 class SQLiteSignalStore:
-    """SQLite event store with upserts and atomic event/checkpoint commits."""
+    """SQLite event store with upserts, checkpoints, and source health."""
 
     def __init__(self, path: str | Path = "signals.db") -> None:
         self.path = Path(path)
@@ -92,6 +105,18 @@ class SQLiteSignalStore:
                 updated_at TEXT NOT NULL,
                 last_success_at TEXT,
                 last_error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS source_health (
+                source_key TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_attempt_at TEXT,
+                last_success_at TEXT,
+                last_error TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                total_runs INTEGER NOT NULL DEFAULT 0,
+                total_events INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -316,6 +341,50 @@ class SQLiteSignalStore:
                 (source_key, cursor, now, last_success, error),
             )
 
+    def upsert_source_health(self, health: SourceHealth) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO source_health (
+                    source_key, status, updated_at, last_attempt_at, last_success_at,
+                    last_error, consecutive_failures, total_runs, total_events
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    status = excluded.status,
+                    updated_at = excluded.updated_at,
+                    last_attempt_at = excluded.last_attempt_at,
+                    last_success_at = excluded.last_success_at,
+                    last_error = excluded.last_error,
+                    consecutive_failures = excluded.consecutive_failures,
+                    total_runs = excluded.total_runs,
+                    total_events = excluded.total_events
+                """,
+                (
+                    health.source_key,
+                    health.status,
+                    health.updated_at.isoformat(),
+                    health.last_attempt_at.isoformat() if health.last_attempt_at else None,
+                    health.last_success_at.isoformat() if health.last_success_at else None,
+                    health.last_error,
+                    health.consecutive_failures,
+                    health.total_runs,
+                    health.total_events,
+                ),
+            )
+
+    def get_source_health(self, source_key: str) -> SourceHealth | None:
+        row = self._connection.execute(
+            "SELECT * FROM source_health WHERE source_key = ?",
+            (source_key,),
+        ).fetchone()
+        return self._row_to_health(row) if row is not None else None
+
+    def list_source_health(self) -> list[SourceHealth]:
+        rows = self._connection.execute(
+            "SELECT * FROM source_health ORDER BY source_key"
+        ).fetchall()
+        return [self._row_to_health(row) for row in rows]
+
     def get(self, event_id: str) -> SignalEvent | None:
         row = self._connection.execute(
             "SELECT * FROM signals WHERE id = ?",
@@ -385,6 +454,28 @@ class SQLiteSignalStore:
                 "collected_at": row["collected_at"],
                 "metadata": json.loads(row["metadata_json"]),
             }
+        )
+
+    @staticmethod
+    def _row_to_health(row: sqlite3.Row) -> SourceHealth:
+        return SourceHealth(
+            source_key=str(row["source_key"]),
+            status=str(row["status"]),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            last_attempt_at=(
+                datetime.fromisoformat(str(row["last_attempt_at"]))
+                if row["last_attempt_at"]
+                else None
+            ),
+            last_success_at=(
+                datetime.fromisoformat(str(row["last_success_at"]))
+                if row["last_success_at"]
+                else None
+            ),
+            last_error=str(row["last_error"]) if row["last_error"] else None,
+            consecutive_failures=int(row["consecutive_failures"]),
+            total_runs=int(row["total_runs"]),
+            total_events=int(row["total_events"]),
         )
 
     def close(self) -> None:

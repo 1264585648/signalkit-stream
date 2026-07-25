@@ -4,7 +4,14 @@ from collections.abc import Callable
 import os
 from typing import Any, Mapping
 
-from signalkit_stream.collectors import Collector, GitHubCollector, HackerNewsCollector, RSSCollector
+from signalkit_stream.collectors import (
+    Collector,
+    GitHubCollector,
+    HackerNewsCollector,
+    RSSCollector,
+    RedditCollector,
+    RedditOAuth,
+)
 from signalkit_stream.config import SourceConfig
 
 CollectorFactory = Callable[[SourceConfig], Collector]
@@ -41,6 +48,7 @@ def default_registry() -> CollectorRegistry:
     registry.register("rss", _rss_factory)
     registry.register("hackernews", _hackernews_factory)
     registry.register("github", _github_factory)
+    registry.register("reddit", _reddit_factory)
     return registry
 
 
@@ -93,6 +101,75 @@ def _github_factory(config: SourceConfig) -> Collector:
         include_comments=comments > 0,
         comments_per_item=comments,
         instance=_optional_string(options.get("instance")),
+    )
+
+
+def _reddit_factory(config: SourceConfig) -> Collector:
+    options = dict(config.options)
+    _reject_unknown(
+        options,
+        {
+            "subreddit",
+            "listing",
+            "access_token_env",
+            "client_id_env",
+            "client_secret_env",
+            "refresh_token_env",
+            "user_agent",
+            "user_agent_env",
+            "instance",
+            "seen_window",
+        },
+        config,
+    )
+    subreddit = _required_string(options, "subreddit", config)
+    listing = str(options.get("listing", "posts")).strip().lower()
+    if listing not in {"posts", "comments"}:
+        raise ValueError(f"source {config.name!r}: listing must be 'posts' or 'comments'")
+
+    access_token_env = str(options.get("access_token_env", "REDDIT_ACCESS_TOKEN")).strip()
+    client_id_env = str(options.get("client_id_env", "REDDIT_CLIENT_ID")).strip()
+    client_secret_env = str(options.get("client_secret_env", "REDDIT_CLIENT_SECRET")).strip()
+    refresh_token_env = str(options.get("refresh_token_env", "REDDIT_REFRESH_TOKEN")).strip()
+    user_agent_env = str(options.get("user_agent_env", "REDDIT_USER_AGENT")).strip()
+    for key, value in {
+        "access_token_env": access_token_env,
+        "client_id_env": client_id_env,
+        "client_secret_env": client_secret_env,
+        "refresh_token_env": refresh_token_env,
+        "user_agent_env": user_agent_env,
+    }.items():
+        if not value:
+            raise ValueError(f"source {config.name!r}: {key} must not be empty")
+
+    user_agent = str(options.get("user_agent") or os.getenv(user_agent_env) or "").strip()
+    if not user_agent:
+        raise ValueError(
+            f"source {config.name!r}: configure user_agent or set {user_agent_env}"
+        )
+
+    oauth = RedditOAuth(
+        access_token=os.getenv(access_token_env),
+        client_id=os.getenv(client_id_env),
+        client_secret=os.getenv(client_secret_env, ""),
+        refresh_token=os.getenv(refresh_token_env),
+    )
+    if not oauth.access_token and not oauth.can_refresh:
+        raise ValueError(
+            f"source {config.name!r}: Reddit OAuth requires {access_token_env} or "
+            f"{client_id_env} + {refresh_token_env}"
+        )
+
+    seen_window = _positive_int(options.get("seen_window", 1000), "seen_window", config)
+    if seen_window < 100:
+        raise ValueError(f"source {config.name!r}: seen_window must be >= 100")
+    return RedditCollector(
+        subreddit,
+        listing=listing,  # type: ignore[arg-type]
+        oauth=oauth,
+        user_agent=user_agent,
+        instance=_optional_string(options.get("instance")),
+        seen_window=seen_window,
     )
 
 

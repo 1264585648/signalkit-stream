@@ -111,7 +111,7 @@ def test_invalid_result_raises_nonretryable_contract_error(
 
 
 @pytest.mark.asyncio
-async def test_pipeline_rejects_invalid_page_before_event_or_checkpoint_commit(tmp_path) -> None:
+async def test_pipeline_rejects_invalid_page_before_event_or_checkpoint_advance(tmp_path) -> None:
     collector = FakeCollector(
         CollectorResult(
             events=[make_event(source="wrong")],
@@ -124,4 +124,9 @@ async def test_pipeline_rejects_invalid_page_before_event_or_checkpoint_commit(t
         with pytest.raises(CollectorError, match="contract violation"):
             await run_collector(collector, limit=10, store=store)
         assert store.count() == 0
-        assert store.get_checkpoint("fake:default") is None
+        checkpoint = store.get_checkpoint("fake:default")
+        assert checkpoint is not None
+        assert checkpoint.cursor.state == {}
+        assert checkpoint.last_success_at is None
+        assert checkpoint.last_error is not None
+        assert "contract violation" in checkpoint.last_error

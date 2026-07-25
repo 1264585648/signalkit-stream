@@ -1,6 +1,6 @@
 # SignalKit Stream architecture
 
-SignalKit Stream owns the external-source ingestion boundary: fetching, source authentication, pagination, checkpoints, normalization, retries, persistence, and delivery. It does not decide whether a signal is commercially interesting; classification, enrichment, scoring, outreach, and agent actions belong downstream.
+SignalKit Stream owns the external-source ingestion boundary: configuration, scheduling, fetching, source authentication, pagination, checkpoints, normalization, retries, persistence, source health, and delivery. It does not decide whether a signal is commercially interesting; classification, enrichment, scoring, outreach, and agent actions belong downstream.
 
 ## Core protocol
 
@@ -60,9 +60,63 @@ Adapters should not duplicate retry loops or invent source-specific exception ty
 
 ## Pagination safety
 
-The runtime stops a pagination loop when a collector reports `has_more=True` but emits zero primary items, or when its cursor does not advance. A hard `max_pages` guard provides an additional safety boundary.
+`run_collector` stops a pagination loop when a collector reports `has_more=True` but emits zero primary items, or when its cursor does not advance. A hard `max_pages` guard provides an additional safety boundary.
 
 A collector that cannot guarantee forward progress must return `has_more=False` and wait for a future polling cycle.
+
+## Continuous runtime
+
+`StreamRuntime` owns long-running scheduling. Each configured source instance gets one worker. Workers share two concurrency boundaries:
+
+```text
+all source workers
+      ↓
+global semaphore
+      ↓
+provider semaphore
+      ↓
+run_collector
+```
+
+The global semaphore limits total in-flight collections. Provider semaphores limit concurrent instances of the same upstream provider, so multiple GitHub queries cannot consume unbounded GitHub request capacity while unrelated RSS or Hacker News sources remain independent.
+
+Each worker follows this state machine:
+
+```text
+scheduled
+   ↓
+check persisted pause
+   ├── paused → sleep until due
+   ↓
+record attempt
+   ↓
+collect + checkpoint
+   ├── success → reset failures → interval / rate-limit pause
+   └── failure → backoff → circuit cooldown after threshold
+```
+
+A rate-limit reset or `Retry-After` value can extend the next poll delay. Failure state is persisted, so process restarts do not accidentally erase an active cooldown and hammer an upstream service.
+
+## Runtime health
+
+Runtime health is deliberately separate from event/checkpoint state. The SQLite health store records:
+
+- source key
+- status
+- consecutive failures
+- last attempt
+- last success
+- last error
+- pause deadline
+- observed rate-limit remaining/reset values
+
+Checkpoint state answers “where should collection resume?” while health state answers “when is this source safe to run again?”. Keeping them separate makes both responsibilities explicit.
+
+## Shutdown semantics
+
+SIGINT/SIGTERM set the runtime stop event. Sleeping workers stop immediately. A collector that is already inside a collection attempt is allowed to finish and commit for a bounded `shutdown_timeout`; after that window, remaining tasks are cancelled.
+
+Because page events and cursors are committed atomically, stopping between pages cannot advance a checkpoint beyond committed data.
 
 ## Extension rule
 
@@ -76,4 +130,4 @@ source-native response
 SignalEvent + Cursor
 ```
 
-Authentication, HTTP retry behavior, persistence, checkpointing, and downstream delivery belong to shared infrastructure rather than each adapter.
+Authentication, HTTP retry behavior, persistence, checkpointing, runtime scheduling, health state, and downstream delivery belong to shared infrastructure rather than each adapter.

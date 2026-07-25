@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 
-from signalkit_stream.cli import main
+import pytest
+
+from signalkit_stream.cli import build_parser, main
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import Cursor
 from signalkit_stream.storage import SQLiteSignalStore, SourceHealth
@@ -96,3 +98,33 @@ def test_delivery_status_and_dead_letter_replay_commands(tmp_path, capsys) -> No
 
     with SQLiteSignalStore(database) as store:
         assert store.delivery_counts("brain") == {"pending": 1}
+
+
+def test_reddit_and_jsonfeed_collectors_are_available_in_cli(monkeypatch) -> None:
+    parser = build_parser()
+    reddit = parser.parse_args(
+        [
+            "collect",
+            "reddit",
+            "SaaS",
+            "--listing",
+            "new",
+            "--comments",
+            "3",
+            "--no-store",
+        ]
+    )
+    jsonfeed = parser.parse_args(
+        ["collect", "jsonfeed", "https://example.com/feed.json", "--no-store"]
+    )
+
+    assert reddit.collector == "reddit"
+    assert reddit.subreddit == "SaaS"
+    assert reddit.comments == 3
+    assert jsonfeed.collector == "jsonfeed"
+
+    monkeypatch.delenv("REDDIT_CLIENT_ID", raising=False)
+    monkeypatch.delenv("REDDIT_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("REDDIT_USER_AGENT", raising=False)
+    with pytest.raises(SystemExit, match="REDDIT_CLIENT_ID"):
+        main(["collect", "reddit", "SaaS", "--no-store"])

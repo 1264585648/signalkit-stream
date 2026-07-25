@@ -483,7 +483,7 @@ class SQLiteSignalStore:
                         sink_key, event_id, status, attempts, next_attempt_at,
                         last_error, delivered_at, updated_at
                     )
-                    SELECT ?, id, 'pending', 0, NULL, NULL, NULL, ? FROM signals
+                    SELECT ?, id, 'pending', 0, NULL, NULL, NULL, ? FROM signals WHERE 1
                     ON CONFLICT(sink_key, event_id) DO NOTHING
                     """,
                     (sink_key, now),

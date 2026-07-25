@@ -19,6 +19,7 @@ class DeliveryResult:
     delivered: int = 0
     failed: int = 0
     dead: int = 0
+    superseded: int = 0
 
 
 class DeliveryEngine:
@@ -66,7 +67,7 @@ class DeliveryEngine:
             limit=self.batch_size,
             now=self._now(),
         )
-        delivered = failed = dead = 0
+        delivered = failed = dead = superseded = 0
         for record in records:
             event = self.store.get(record.event_id)
             if event is None:
@@ -81,6 +82,7 @@ class DeliveryEngine:
                 dead += 1
                 continue
 
+            sent_hash = event.fingerprint()
             try:
                 await sink.send(event)
             except asyncio.CancelledError:
@@ -124,6 +126,19 @@ class DeliveryEngine:
                 else:
                     failed += 1
             else:
+                current = self.store.get(event.id)
+                if current is None or current.fingerprint() != sent_hash:
+                    # The source object changed while the sink call was in flight. The
+                    # update trigger has already reset its delivery row to pending.
+                    # Never overwrite that newer pending state with success for the
+                    # older payload; the next delivery pass will send the new version.
+                    superseded += 1
+                    logger.info(
+                        "sink=%s event=%s status=superseded-during-delivery",
+                        sink.key,
+                        event.id,
+                    )
+                    continue
                 self.store.mark_delivery_success(sink.key, event.id, delivered_at=self._now())
                 delivered += 1
 
@@ -133,6 +148,7 @@ class DeliveryEngine:
             delivered=delivered,
             failed=failed,
             dead=dead,
+            superseded=superseded,
         )
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:

@@ -28,6 +28,27 @@ class RuntimeConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class DeliveryConfig:
+    interval: float = 1.0
+    batch_size: int = 100
+    max_attempts: int = 5
+    backoff_base: float = 5.0
+    max_backoff: float = 300.0
+
+    def __post_init__(self) -> None:
+        if self.interval <= 0:
+            raise ValueError("delivery.interval must be > 0")
+        if self.batch_size < 1:
+            raise ValueError("delivery.batch_size must be >= 1")
+        if self.max_attempts < 1:
+            raise ValueError("delivery.max_attempts must be >= 1")
+        if self.backoff_base <= 0:
+            raise ValueError("delivery.backoff_base must be > 0")
+        if self.max_backoff <= 0:
+            raise ValueError("delivery.max_backoff must be > 0")
+
+
+@dataclass(slots=True, frozen=True)
 class SourceConfig:
     name: str
     type: str
@@ -48,17 +69,44 @@ class SourceConfig:
 
 
 @dataclass(slots=True, frozen=True)
-class StreamConfig:
-    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-    sources: tuple[SourceConfig, ...] = ()
+class SinkConfig:
+    name: str
+    type: str
+    enabled: bool = True
+    options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        names = [source.name for source in self.sources]
-        duplicates = sorted({name for name in names if names.count(name) > 1})
-        if duplicates:
-            raise ValueError(f"duplicate source names: {', '.join(duplicates)}")
+        if not self.name.strip():
+            raise ValueError("sink.name must not be empty")
+        if not self.type.strip():
+            raise ValueError(f"sink {self.name!r}: type must not be empty")
+
+
+@dataclass(slots=True, frozen=True)
+class StreamConfig:
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
+    sources: tuple[SourceConfig, ...] = ()
+    sinks: tuple[SinkConfig, ...] = ()
+
+    def __post_init__(self) -> None:
+        source_names = [source.name for source in self.sources]
+        source_duplicates = sorted(
+            {name for name in source_names if source_names.count(name) > 1}
+        )
+        if source_duplicates:
+            raise ValueError(f"duplicate source names: {', '.join(source_duplicates)}")
         if not any(source.enabled for source in self.sources):
             raise ValueError("configuration must contain at least one enabled source")
+
+        sink_names = [sink.name for sink in self.sinks]
+        sink_duplicates = sorted({name for name in sink_names if sink_names.count(name) > 1})
+        if sink_duplicates:
+            raise ValueError(f"duplicate sink names: {', '.join(sink_duplicates)}")
+
+    @property
+    def enabled_sinks(self) -> tuple[SinkConfig, ...]:
+        return tuple(sink for sink in self.sinks if sink.enabled)
 
 
 _RUNTIME_KEYS = {
@@ -68,7 +116,9 @@ _RUNTIME_KEYS = {
     "circuit_cooldown",
     "failure_backoff_base",
 }
+_DELIVERY_KEYS = {"interval", "batch_size", "max_attempts", "backoff_base", "max_backoff"}
 _SOURCE_KEYS = {"name", "type", "interval", "limit", "enabled"}
+_SINK_KEYS = {"name", "type", "enabled"}
 
 
 def load_config(path: str | Path) -> StreamConfig:
@@ -79,7 +129,7 @@ def load_config(path: str | Path) -> StreamConfig:
 
 
 def parse_config(payload: Mapping[str, Any]) -> StreamConfig:
-    unknown_top = set(payload) - {"runtime", "sources"}
+    unknown_top = set(payload) - {"runtime", "delivery", "sources", "sinks"}
     if unknown_top:
         raise ValueError(f"unknown top-level configuration keys: {', '.join(sorted(unknown_top))}")
 
@@ -106,6 +156,29 @@ def parse_config(payload: Mapping[str, Any]) -> StreamConfig:
         ),
     )
 
+    delivery_payload = payload.get("delivery", {})
+    if not isinstance(delivery_payload, Mapping):
+        raise ValueError("delivery must be a TOML table")
+    unknown_delivery = set(delivery_payload) - _DELIVERY_KEYS
+    if unknown_delivery:
+        raise ValueError(f"unknown delivery keys: {', '.join(sorted(unknown_delivery))}")
+    delivery = DeliveryConfig(
+        interval=_float(delivery_payload.get("interval", 1.0), "delivery.interval"),
+        batch_size=_int(delivery_payload.get("batch_size", 100), "delivery.batch_size"),
+        max_attempts=_int(
+            delivery_payload.get("max_attempts", 5),
+            "delivery.max_attempts",
+        ),
+        backoff_base=_float(
+            delivery_payload.get("backoff_base", 5.0),
+            "delivery.backoff_base",
+        ),
+        max_backoff=_float(
+            delivery_payload.get("max_backoff", 300.0),
+            "delivery.max_backoff",
+        ),
+    )
+
     source_payloads = payload.get("sources", [])
     if not isinstance(source_payloads, list):
         raise ValueError("sources must be an array of TOML tables")
@@ -128,7 +201,32 @@ def parse_config(payload: Mapping[str, Any]) -> StreamConfig:
             )
         )
 
-    return StreamConfig(runtime=runtime, sources=tuple(sources))
+    sink_payloads = payload.get("sinks", [])
+    if not isinstance(sink_payloads, list):
+        raise ValueError("sinks must be an array of TOML tables")
+
+    sinks: list[SinkConfig] = []
+    for index, raw in enumerate(sink_payloads):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"sinks[{index}] must be a TOML table")
+        name = str(raw.get("name", "")).strip()
+        sink_type = str(raw.get("type", "")).strip()
+        options = {key: value for key, value in raw.items() if key not in _SINK_KEYS}
+        sinks.append(
+            SinkConfig(
+                name=name,
+                type=sink_type,
+                enabled=_bool(raw.get("enabled", True), f"sink {name!r}.enabled"),
+                options=options,
+            )
+        )
+
+    return StreamConfig(
+        runtime=runtime,
+        delivery=delivery,
+        sources=tuple(sources),
+        sinks=tuple(sinks),
+    )
 
 
 def sample_config() -> str:
@@ -138,6 +236,13 @@ concurrency = 4
 failure_threshold = 5
 circuit_cooldown = 300
 failure_backoff_base = 5
+
+[delivery]
+interval = 1
+batch_size = 100
+max_attempts = 5
+backoff_base = 5
+max_backoff = 300
 
 [[sources]]
 name = "hackernews-new"
@@ -162,6 +267,16 @@ comments = 0
 # interval = 300
 # limit = 100
 # url = "https://example.com/feed.xml"
+
+# [[sinks]]
+# name = "stdout"
+# type = "stdout"
+
+# [[sinks]]
+# name = "lead-webhook"
+# type = "webhook"
+# url = "https://example.com/signals"
+# bearer_token_env = "SIGNALKIT_WEBHOOK_TOKEN"
 '''
 
 

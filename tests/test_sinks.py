@@ -13,15 +13,16 @@ from signalkit_stream.sinks import (
     StdoutSink,
     WebhookSink,
     default_sink_registry,
+    delivery_idempotency_key,
 )
 
 
-def event() -> SignalEvent:
+def event(content: str = "hello") -> SignalEvent:
     return SignalEvent(
         id="sig_sink",
         source="test",
         kind=SignalKind.POST,
-        content="hello",
+        content=content,
         url="https://example.com/1",
         created_at=datetime(2026, 7, 25, tzinfo=UTC),
     )
@@ -41,8 +42,9 @@ async def test_stdout_and_jsonl_sinks(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_webhook_sends_idempotency_headers_and_classifies_failure() -> None:
+async def test_webhook_sends_versioned_idempotency_headers_and_classifies_failure() -> None:
     requests: list[httpx.Request] = []
+    item = event()
 
     def success(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -50,11 +52,15 @@ async def test_webhook_sends_idempotency_headers_and_classifies_failure() -> Non
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(success)) as client:
         sink = WebhookSink("brain", "https://example.com/hook", token="secret", client=client)
-        await sink.send(event())
+        await sink.send(item)
 
     request = requests[0]
-    assert request.headers["Idempotency-Key"] == "signalkit:brain:sig_sink"
+    assert request.headers["Idempotency-Key"] == delivery_idempotency_key("brain", item)
+    assert request.headers["X-SignalKit-Event-Hash"] == item.fingerprint()
     assert request.headers["Authorization"] == "Bearer secret"
+    assert delivery_idempotency_key("brain", item) != delivery_idempotency_key(
+        "brain", event("changed")
+    )
 
     def limited(request: httpx.Request) -> httpx.Response:
         return httpx.Response(429, headers={"Retry-After": "12"}, request=request)
@@ -62,7 +68,7 @@ async def test_webhook_sends_idempotency_headers_and_classifies_failure() -> Non
     async with httpx.AsyncClient(transport=httpx.MockTransport(limited)) as client:
         sink = WebhookSink("brain", "https://example.com/hook", client=client)
         with pytest.raises(SinkError) as caught:
-            await sink.send(event())
+            await sink.send(item)
 
     assert caught.value.retryable is True
     assert caught.value.status_code == 429

@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
+import hashlib
 import json
 import os
 import sys
@@ -83,8 +84,9 @@ class WebhookSink(Sink):
     async def send(self, event: SignalEvent) -> None:
         headers = {
             "Content-Type": "application/json",
-            "Idempotency-Key": f"signalkit:{self.key}:{event.id}",
+            "Idempotency-Key": delivery_idempotency_key(self.key, event),
             "X-SignalKit-Event-ID": event.id,
+            "X-SignalKit-Event-Hash": event.fingerprint(),
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
@@ -202,3 +204,17 @@ def _parse_retry_after(value: str | None) -> float | None:
         return max(0.0, float(value))
     except ValueError:
         return None
+
+
+def delivery_idempotency_key(sink_key: str, event: SignalEvent) -> str:
+    """Return a stable key for one sink + source-object version.
+
+    The normalized event ID is stable across source mutations, so using only the ID
+    would cause a downstream idempotency cache to suppress legitimate updates. The
+    content fingerprint makes retries of the same version stable while giving a new
+    version a distinct key.
+    """
+
+    raw = f"{sink_key}\x1f{event.id}\x1f{event.fingerprint()}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return f"signalkit:{digest}"

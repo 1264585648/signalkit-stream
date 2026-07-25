@@ -1,0 +1,29 @@
+[runtime]
+database = "signals.db"
+global_concurrency = 4
+provider_concurrency = 2
+shutdown_timeout = 15
+default_interval = 60
+failure_threshold = 3
+cooldown = 300
+
+[[sources]]
+name = "hn-ask"
+type = "hackernews"
+interval = 60
+limit = 50
+options = { feed = "askstories", comments = 3 }
+
+[[sources]]
+name = "github-demand"
+type = "github"
+interval = 120
+limit = 100
+options = { query = '"looking for" is:issue is:open', comments = 3, token_env = "GITHUB_TOKEN" }
+
+[[sources]]
+name = "hn-rss"
+type = "rss"
+interval = 60
+limit = 100
+options = { url = "https://hnrss.org/newest", source = "rss" }

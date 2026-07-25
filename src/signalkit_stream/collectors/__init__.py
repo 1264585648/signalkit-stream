@@ -3,10 +3,12 @@ from signalkit_stream.collectors.github import GitHubCollector
 from signalkit_stream.collectors.hackernews import HackerNewsCollector
 from signalkit_stream.collectors.jsonfeed import JSONFeedCollector
 from signalkit_stream.collectors.reddit import RedditCollector
+from signalkit_stream.collectors.rest import GenericRESTCollector
 from signalkit_stream.collectors.rss import RSSCollector
 
 __all__ = [
     "Collector",
+    "GenericRESTCollector",
     "GitHubCollector",
     "HTTPCollector",
     "HackerNewsCollector",

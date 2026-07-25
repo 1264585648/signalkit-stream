@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from signalkit_stream.collectors.base import Collector
+from signalkit_stream.contracts import validate_collector_result
 from signalkit_stream.models import SignalEvent
 from signalkit_stream.protocol import CollectorContext, CollectorError, Cursor, RateLimitSnapshot
 from signalkit_stream.storage import SignalStore, StoreWriteResult
@@ -38,9 +39,9 @@ async def run_collector(
 ) -> CollectionResult:
     """Drain resumable collector pages up to ``limit`` primary items.
 
-    Each page is atomically persisted with its checkpoint. If a later page fails,
-    a subsequent run resumes from the last committed page, yielding at-least-once
-    collection with idempotent storage.
+    Each page is contract-validated before it can touch persistence, then atomically
+    stored with its checkpoint. If a later page fails, a subsequent run resumes from
+    the last committed page, yielding at-least-once collection with idempotent storage.
     """
 
     if limit < 1:
@@ -69,6 +70,12 @@ async def run_collector(
             context = CollectorContext(limit=remaining, metadata=metadata or {})
             previous_cursor = cursor
             page = await collector.collect(context=context, cursor=cursor)
+            validate_collector_result(
+                collector,
+                page,
+                context=context,
+                previous_cursor=previous_cursor,
+            )
             pages += 1
             events.extend(page.events)
             warnings.extend(page.warnings)

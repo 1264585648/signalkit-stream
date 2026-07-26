@@ -232,3 +232,36 @@ async def test_reddit_oauth_http_error_is_normalized_as_auth() -> None:
     assert caught.value.kind is CollectorErrorKind.AUTH
     assert caught.value.status_code == 401
     assert caught.value.retryable is False
+
+
+def test_reddit_collector_is_a_single_implementation_on_httpcollector() -> None:
+    """Guard against the dead second implementation returning.
+
+    collect() used to live in collectors/_reddit_impl.py behind a shim that overrode
+    __init__ and _token, so the file a maintainer reads for the collect path documented
+    a credential contract (client_id AND client_secret required) that the live shim had
+    already replaced with the three modes in docs/REDDIT.md.
+    """
+
+    from signalkit_stream.collectors.base import HTTPCollector
+
+    assert RedditCollector.__mro__[1] is HTTPCollector
+    for name in ("__init__", "collect", "request", "_token", "_comments", "auth_mode"):
+        owner = next(
+            klass for klass in RedditCollector.__mro__ if name in vars(klass)
+        )
+        assert owner is RedditCollector, f"{name} is not defined in collectors/reddit.py"
+
+
+def test_reddit_accepts_a_static_access_token_without_app_credentials() -> None:
+    """The merged file must keep the shim's contract, not the impl's stricter one."""
+
+    collector = RedditCollector(
+        "python",
+        access_token="static-token",
+        user_agent="signalkit-test",
+    )
+
+    assert collector.auth_mode == "access_token"
+    assert collector.client_id == ""
+    assert collector.client_secret == ""

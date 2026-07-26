@@ -163,11 +163,6 @@ def _reddit_factory(config: SourceConfig) -> Collector:
         "client_secret_env",
         config,
     )
-    user_agent = _required_environment(
-        options.get("user_agent_env", "REDDIT_USER_AGENT"),
-        "user_agent_env",
-        config,
-    )
 
     if refresh_token and not client_id:
         env_name = str(options.get("client_id_env", "REDDIT_CLIENT_ID")).strip()
@@ -186,6 +181,12 @@ def _reddit_factory(config: SourceConfig) -> Collector:
             "client_secret_env",
             config,
         )
+
+    user_agent = _required_environment(
+        options.get("user_agent_env", "REDDIT_USER_AGENT"),
+        "user_agent_env",
+        config,
+    )
 
     return RedditCollector(
         subreddit,

@@ -2,6 +2,8 @@ name: Live Compatibility Smoke
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
 
 permissions:
   contents: read
@@ -21,6 +23,11 @@ jobs:
       - name: Run official-source live smoke
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          SIGNALKIT_LIVE_RSS_URL: ${{ vars.SIGNALKIT_LIVE_RSS_URL }}
+          SIGNALKIT_LIVE_JSON_FEED_URL: ${{ vars.SIGNALKIT_LIVE_JSON_FEED_URL }}
+          SIGNALKIT_LIVE_REDDIT_SUBREDDIT: ${{ vars.SIGNALKIT_LIVE_REDDIT_SUBREDDIT }}
+          REDDIT_ACCESS_TOKEN: ${{ secrets.REDDIT_ACCESS_TOKEN }}
+          REDDIT_REFRESH_TOKEN: ${{ secrets.REDDIT_REFRESH_TOKEN }}
           REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
           REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}

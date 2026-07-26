@@ -12,7 +12,6 @@ from signalkit_stream.collectors import (
     JSONFeedCollector,
     RSSCollector,
     RedditCollector,
-    RedditOAuth,
 )
 from signalkit_stream.collectors.base import Collector
 from signalkit_stream.protocol import CollectorContext, Cursor
@@ -110,6 +109,12 @@ def github_handler(request: httpx.Request) -> httpx.Response:
 
 
 def reddit_handler(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/api/v1/access_token":
+        return httpx.Response(
+            200,
+            json={"access_token": "token", "token_type": "bearer", "expires_in": 3600},
+            request=request,
+        )
     assert request.url.path == "/r/python/new"
     return httpx.Response(
         200,
@@ -178,7 +183,8 @@ CASES = [
         reddit_handler,
         lambda client: RedditCollector(
             "python",
-            oauth=RedditOAuth(access_token="token"),
+            client_id="client-id",
+            client_secret="client-secret",
             user_agent="linux:signalkit-stream:contract (by /u/example)",
             instance="contract",
             client=client,

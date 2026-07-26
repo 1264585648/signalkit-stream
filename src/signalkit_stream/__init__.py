@@ -17,6 +17,15 @@ from signalkit_stream.diagnostics import (
     validate_config_file,
     validate_stream_config,
 )
+from signalkit_stream.migrations import (
+    DATABASE_SCHEMA_VERSION,
+    DatabaseMigrationError,
+    DatabaseSchemaError,
+    DatabaseSchemaTooNew,
+    get_database_schema_version,
+    migrate_database,
+    validate_database_schema,
+)
 from signalkit_stream.models import SCHEMA_VERSION, SignalEvent, SignalKind
 from signalkit_stream.pipeline import CollectionResult, run_collector
 from signalkit_stream.protocol import (
@@ -48,6 +57,10 @@ __all__ = [
     "CollectorErrorKind",
     "CollectorResult",
     "Cursor",
+    "DATABASE_SCHEMA_VERSION",
+    "DatabaseMigrationError",
+    "DatabaseSchemaError",
+    "DatabaseSchemaTooNew",
     "DeliveryEngine",
     "DeliveryRecord",
     "DeliveryResult",
@@ -76,11 +89,14 @@ __all__ = [
     "StreamRuntime",
     "WebhookSink",
     "doctor",
+    "get_database_schema_version",
     "load_config",
+    "migrate_database",
     "run_collector",
     "validate_collector_result",
     "validate_config_file",
+    "validate_database_schema",
     "validate_stream_config",
 ]
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"

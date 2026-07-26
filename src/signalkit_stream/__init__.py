@@ -17,6 +17,12 @@ from signalkit_stream.diagnostics import (
     validate_config_file,
     validate_stream_config,
 )
+from signalkit_stream.logging_utils import (
+    JsonLogFormatter,
+    LogFormat,
+    TextLogFormatter,
+    configure_logging,
+)
 from signalkit_stream.maintenance import (
     BackupResult,
     VerifyResult,
@@ -33,6 +39,13 @@ from signalkit_stream.migrations import (
     validate_database_schema,
 )
 from signalkit_stream.models import SCHEMA_VERSION, SignalEvent, SignalKind
+from signalkit_stream.observability import (
+    SinkStatusSnapshot,
+    SourceStatusSnapshot,
+    StreamSnapshot,
+    format_snapshot,
+    read_snapshot,
+)
 from signalkit_stream.pipeline import CollectionResult, run_collector
 from signalkit_stream.protocol import (
     PROTOCOL_VERSION,
@@ -74,7 +87,9 @@ __all__ = [
     "DiagnosticCheck",
     "DiagnosticReport",
     "DiagnosticStatus",
+    "JsonLogFormatter",
     "JsonlSink",
+    "LogFormat",
     "PROTOCOL_VERSION",
     "RateLimitSnapshot",
     "RawEvent",
@@ -86,21 +101,28 @@ __all__ = [
     "Sink",
     "SinkConfig",
     "SinkError",
+    "SinkStatusSnapshot",
     "SourceConfig",
     "SourceHealth",
     "SourceIdentity",
     "SourceRunResult",
+    "SourceStatusSnapshot",
     "StdoutSink",
     "StoreWriteResult",
     "StreamConfig",
     "StreamRuntime",
+    "StreamSnapshot",
+    "TextLogFormatter",
     "VerifyResult",
     "WebhookSink",
     "backup_database",
+    "configure_logging",
     "doctor",
+    "format_snapshot",
     "get_database_schema_version",
     "load_config",
     "migrate_database",
+    "read_snapshot",
     "run_collector",
     "validate_collector_result",
     "validate_config_file",
@@ -109,4 +131,4 @@ __all__ = [
     "verify_database",
 ]
 
-__version__ = "0.6.2"
+__version__ = "0.7.0"

@@ -17,6 +17,12 @@ from signalkit_stream.diagnostics import (
     validate_config_file,
     validate_stream_config,
 )
+from signalkit_stream.maintenance import (
+    BackupResult,
+    VerifyResult,
+    backup_database,
+    verify_database,
+)
 from signalkit_stream.migrations import (
     DATABASE_SCHEMA_VERSION,
     DatabaseMigrationError,
@@ -50,6 +56,7 @@ from signalkit_stream.storage import (
 )
 
 __all__ = [
+    "BackupResult",
     "Checkpoint",
     "CollectionResult",
     "CollectorContext",
@@ -87,7 +94,9 @@ __all__ = [
     "StoreWriteResult",
     "StreamConfig",
     "StreamRuntime",
+    "VerifyResult",
     "WebhookSink",
+    "backup_database",
     "doctor",
     "get_database_schema_version",
     "load_config",
@@ -97,6 +106,7 @@ __all__ = [
     "validate_config_file",
     "validate_database_schema",
     "validate_stream_config",
+    "verify_database",
 ]
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"

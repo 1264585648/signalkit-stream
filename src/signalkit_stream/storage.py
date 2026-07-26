@@ -108,12 +108,37 @@ class SQLiteSignalStore:
         try:
             self._connection = sqlite3.connect(self.path, timeout=timeout)
             self._connection.row_factory = sqlite3.Row
+            self._configure_connection(self._connection)
             self._initialize()
         except Exception:
             connection = getattr(self, "_connection", None)
             if connection is not None:
                 connection.close()
             raise
+
+    @staticmethod
+    def _configure_connection(connection: sqlite3.Connection) -> None:
+        """Apply the SQLite pragmas the storage layer depends on.
+
+        ``journal_mode=WAL`` is a persistent property of the database file, while
+        ``synchronous`` and ``foreign_keys`` are per-connection and must be re-applied by
+        every connection this layer opens. WAL keeps readers (``signalkit status``,
+        ``doctor``, ``read_snapshot``) working while a writer holds the write lock, and
+        with ``synchronous=NORMAL`` the commit-per-delivery path stops fsyncing twice per
+        row.
+
+        Switching an existing rollback-journal database to WAL needs the write lock, so a
+        busy database is deliberately left in its current journal mode instead of failing
+        to open: a slower journal mode is always preferable to an unusable store, and the
+        next open of an uncontended database performs the switch.
+        """
+
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass
 
     def _initialize(self) -> None:
         migrate_database(self._connection)

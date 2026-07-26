@@ -2,13 +2,19 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import os
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
-from signalkit_stream.protocol import CollectorContext, CollectorResult, Cursor
+from signalkit_stream.protocol import (
+    CollectorContext,
+    CollectorError,
+    CollectorErrorKind,
+    CollectorResult,
+    Cursor,
+)
 
 
 class GitHubCollector(HTTPCollector):
@@ -50,10 +56,11 @@ class GitHubCollector(HTTPCollector):
         page = max(1, int(state.get("page", 1)))
         offset = max(0, int(state.get("offset", 0)))
         watermark = str(state.get("watermark", "")).strip() or None
+        watermark_time = self._cursor_time(watermark) if watermark else None
         page_size = max(1, min(100, int(state.get("per_page", min(ctx.limit, 100)))))
         effective_query = self.query
-        if watermark:
-            effective_query = f"{effective_query} updated:>{self._github_time(watermark)}"
+        if watermark_time is not None:
+            effective_query = f"{effective_query} updated:>{self._github_time(watermark_time)}"
 
         headers = {
             "Accept": "application/vnd.github+json",
@@ -77,19 +84,26 @@ class GitHubCollector(HTTPCollector):
                 },
                 headers=headers,
             )
-            payload = response.json()
-            items = payload.get("items", []) if isinstance(payload, dict) else []
-            total_count = int(payload.get("total_count", len(items))) if isinstance(payload, dict) else len(items)
+            payload = self._json_payload(response, label="GitHub search")
+            if not isinstance(payload, dict):
+                raise self._parse_error("GitHub search response must be a JSON object")
+            items = payload.get("items", [])
+            if not isinstance(items, list):
+                raise self._parse_error("GitHub search items must be a list")
+            total_count = self._safe_total_count(payload.get("total_count"), fallback=len(items))
 
             selected_items = items[offset : offset + ctx.limit]
+            for item in selected_items:
+                if not isinstance(item, dict):
+                    raise self._parse_error("GitHub search item must be a JSON object")
             events: list[SignalEvent] = []
-            batch_watermark = watermark
+            batch_watermark_time = watermark_time
             for item in selected_items:
                 event = self._item_event(item)
                 events.append(event)
                 timestamp = event.updated_at or event.created_at
-                if batch_watermark is None or timestamp > self._parse_time(batch_watermark):
-                    batch_watermark = timestamp.isoformat()
+                if batch_watermark_time is None or timestamp > batch_watermark_time:
+                    batch_watermark_time = timestamp
                 if self.include_comments and self.comments_per_item and item.get("comments"):
                     events.extend(
                         await self._comments(
@@ -129,7 +143,9 @@ class GitHubCollector(HTTPCollector):
                 "page": 1,
                 "offset": 0,
                 "per_page": page_size,
-                "watermark": batch_watermark or watermark or "",
+                "watermark": (
+                    batch_watermark_time.isoformat() if batch_watermark_time else watermark or ""
+                ),
             }
 
         return CollectorResult(
@@ -146,7 +162,13 @@ class GitHubCollector(HTTPCollector):
         repository_url = str(item.get("repository_url", ""))
         number = item.get("number")
         external_id = str(item.get("node_id") or f"{repository_url}#{number}")
-        labels = [label.get("name") for label in item.get("labels", []) if label.get("name")]
+        raw_labels = item.get("labels")
+        labels = [
+            label["name"]
+            for label in (raw_labels if isinstance(raw_labels, list) else [])
+            if isinstance(label, Mapping) and label.get("name")
+        ]
+        title = item.get("title")
 
         return SignalEvent(
             id=SignalEvent.stable_id(
@@ -158,9 +180,9 @@ class GitHubCollector(HTTPCollector):
             source=self.source,
             source_instance=self.instance,
             kind=kind,
-            title=item.get("title"),
+            title=str(title) if title is not None else None,
             content=str(item.get("body") or ""),
-            author=(item.get("user") or {}).get("login"),
+            author=_login(item.get("user")),
             url=str(item.get("html_url") or repository_url),
             created_at=self._parse_time(item.get("created_at")),
             updated_at=self._parse_time(item.get("updated_at")) if item.get("updated_at") else None,
@@ -196,10 +218,14 @@ class GitHubCollector(HTTPCollector):
             params={"per_page": min(self.comments_per_item, 100), "sort": "created", "direction": "asc"},
             headers=headers,
         )
-        payload = response.json()
-        comments = payload if isinstance(payload, list) else []
+        payload = self._json_payload(response, label="GitHub comments")
+        if not isinstance(payload, list):
+            raise self._parse_error("GitHub comments response must be a JSON array")
+        comments = payload
         result: list[SignalEvent] = []
         for comment in comments[: self.comments_per_item]:
+            if not isinstance(comment, dict):
+                raise self._parse_error("GitHub comment must be a JSON object")
             external_id = str(comment.get("node_id") or comment.get("id"))
             result.append(
                 SignalEvent(
@@ -213,7 +239,7 @@ class GitHubCollector(HTTPCollector):
                     source_instance=self.instance,
                     kind=SignalKind.COMMENT,
                     content=str(comment.get("body") or ""),
-                    author=(comment.get("user") or {}).get("login"),
+                    author=_login(comment.get("user")),
                     url=str(comment.get("html_url") or item.get("html_url")),
                     created_at=self._parse_time(comment.get("created_at")),
                     updated_at=(
@@ -229,16 +255,68 @@ class GitHubCollector(HTTPCollector):
             )
         return result
 
-    @staticmethod
-    def _parse_time(value: str | None) -> datetime:
+    def _json_payload(self, response: httpx.Response, *, label: str) -> Any:
+        """Decode a JSON body, mapping decode failures onto the PARSE contract.
+
+        GitHub answers with an HTML error/maintenance page under a 200 often enough that
+        an unguarded ``response.json()`` turns a transient upstream blip into an
+        ``INTERNAL`` error, which the contract validator reserves for broken adapters.
+        """
+
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise self._parse_error(
+                f"invalid JSON in {label} response",
+                details={"content_type": response.headers.get("Content-Type", "")},
+            ) from exc
+
+    def _parse_time(self, value: str | None) -> datetime:
         if not value:
             return datetime.now(UTC)
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+        return self._time(value, field="timestamp", kind=CollectorErrorKind.PARSE)
+
+    def _cursor_time(self, value: str) -> datetime:
+        return self._time(value, field="cursor watermark", kind=CollectorErrorKind.CURSOR)
+
+    def _time(self, value: str, *, field: str, kind: CollectorErrorKind) -> datetime:
+        text = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise CollectorError(
+                f"GitHub {field} is not an ISO-8601 timestamp",
+                kind=kind,
+                source_key=self.identity.key,
+                retryable=False,
+                details={"field": field, "value": text[:80]},
+            ) from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def _safe_total_count(self, value: object, *, fallback: int) -> int:
+        if value is None:
+            return fallback
+        if isinstance(value, bool):
+            raise self._parse_error("GitHub total_count must be an integer")
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise self._parse_error("GitHub total_count must be an integer") from exc
+
+    def _parse_error(self, message: str, *, details: Mapping[str, Any] | None = None) -> CollectorError:
+        return CollectorError(
+            message,
+            kind=CollectorErrorKind.PARSE,
+            source_key=self.identity.key,
+            retryable=False,
+            details=details,
+        )
 
     @staticmethod
-    def _github_time(value: str) -> str:
-        parsed = GitHubCollector._parse_time(value)
-        return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+    def _github_time(value: datetime) -> str:
+        return value.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     @staticmethod
     def _instance_for_query(query: str) -> str:
@@ -246,3 +324,10 @@ class GitHubCollector(HTTPCollector):
 
         digest = hashlib.sha256(query.strip().encode("utf-8")).hexdigest()[:12]
         return f"search-{digest}"
+
+
+def _login(value: object) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    login = value.get("login")
+    return str(login) if login is not None else None

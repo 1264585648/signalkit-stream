@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 import httpx
 
 from signalkit_stream.collectors._text import html_to_text
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
-from signalkit_stream.protocol import CollectorContext, CollectorResult, Cursor
+from signalkit_stream.protocol import (
+    CollectorContext,
+    CollectorError,
+    CollectorErrorKind,
+    CollectorResult,
+    Cursor,
+)
 
 HNFeed = Literal[
     "topstories",
@@ -53,7 +59,16 @@ class HackerNewsCollector(HTTPCollector):
     ) -> CollectorResult:
         ctx = self.context(context)
         self.validate_cursor(cursor)
-        seen_ids = [int(value) for value in (cursor.state.get("seen_ids", []) if cursor else [])]
+        raw_seen = cursor.state.get("seen_ids", []) if cursor else []
+        try:
+            seen_ids = [int(value) for value in raw_seen]
+        except (TypeError, ValueError) as exc:
+            raise CollectorError(
+                "Hacker News cursor seen_ids must contain integers",
+                kind=CollectorErrorKind.CURSOR,
+                source_key=self.identity.key,
+                retryable=False,
+            ) from exc
         seen = set(seen_ids)
 
         async with self.http_client() as client:
@@ -63,7 +78,7 @@ class HackerNewsCollector(HTTPCollector):
                 f"{self.API_ROOT}/{self.feed}.json",
                 context=ctx,
             )
-            all_ids = [int(value) for value in (ids_response.json() or [])]
+            all_ids = self._item_ids(ids_response)
             candidates = [item_id for item_id in all_ids if item_id not in seen]
             story_ids = candidates[: ctx.limit]
             stories = await asyncio.gather(
@@ -79,15 +94,19 @@ class HackerNewsCollector(HTTPCollector):
                 event = self._story_event(story)
                 events.append(event)
                 if self.include_comments and self.comments_per_story:
-                    comment_ids = list(story.get("kids") or [])[: self.comments_per_story]
+                    comment_ids = self._comment_ids(story)
                     comments = await asyncio.gather(
                         *(
-                            self._get_item(client, int(comment_id), context=ctx)
+                            self._get_item(client, comment_id, context=ctx)
                             for comment_id in comment_ids
                         )
                     )
                     events.extend(
-                        self._comment_event(comment, story_id=story["id"], parent_event_id=event.id)
+                        self._comment_event(
+                            comment,
+                            story_id=self._required_id(story),
+                            parent_event_id=event.id,
+                        )
                         for comment in comments
                         if comment and not comment.get("deleted") and not comment.get("dead")
                     )
@@ -118,11 +137,69 @@ class HackerNewsCollector(HTTPCollector):
             f"{self.API_ROOT}/item/{item_id}.json",
             context=context,
         )
-        data = response.json()
+        data = self._json_payload(response, label=f"Hacker News item {item_id}")
         return data if isinstance(data, dict) else None
 
+    def _item_ids(self, response: httpx.Response) -> list[int]:
+        """Decode the feed's id array, mapping malformed bodies onto the PARSE contract."""
+
+        payload = self._json_payload(response, label=f"Hacker News {self.feed}")
+        if payload is None:
+            return []
+        if not isinstance(payload, list):
+            raise self._parse_error(f"Hacker News {self.feed} response must be a JSON array")
+        return [self._item_id(value, field=f"{self.feed} id") for value in payload]
+
+    def _comment_ids(self, story: dict[str, Any]) -> list[int]:
+        raw_kids = story.get("kids") or []
+        if not isinstance(raw_kids, list):
+            raise self._parse_error("Hacker News story kids must be a JSON array")
+        return [
+            self._item_id(value, field="comment id")
+            for value in raw_kids[: self.comments_per_story]
+        ]
+
+    def _item_id(self, value: object, *, field: str) -> int:
+        if isinstance(value, bool):
+            raise self._parse_error(f"Hacker News {field} must be an integer")
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise self._parse_error(
+                f"Hacker News {field} must be an integer",
+                details={"value": str(value)[:80]},
+            ) from exc
+
+    def _required_id(self, item: dict[str, Any]) -> int:
+        if "id" not in item:
+            raise self._parse_error("Hacker News item is missing its id")
+        return self._item_id(item["id"], field="item id")
+
+    def _json_payload(self, response: httpx.Response, *, label: str) -> Any:
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise self._parse_error(
+                f"invalid JSON in {label} response",
+                details={"content_type": response.headers.get("Content-Type", "")},
+            ) from exc
+
+    def _parse_error(
+        self,
+        message: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> CollectorError:
+        return CollectorError(
+            message,
+            kind=CollectorErrorKind.PARSE,
+            source_key=self.identity.key,
+            retryable=False,
+            details=details,
+        )
+
     def _story_event(self, item: dict[str, Any]) -> SignalEvent:
-        item_id = str(item["id"])
+        item_id = str(self._required_id(item))
         title = html_to_text(item.get("title")) or None
         text = html_to_text(item.get("text"))
         url = str(item.get("url") or f"https://news.ycombinator.com/item?id={item_id}")
@@ -156,7 +233,7 @@ class HackerNewsCollector(HTTPCollector):
         story_id: int,
         parent_event_id: str,
     ) -> SignalEvent:
-        item_id = str(item["id"])
+        item_id = str(self._required_id(item))
         return SignalEvent(
             id=SignalEvent.stable_id(
                 self.source,

@@ -61,6 +61,11 @@ class Collector(ABC):
                 retryable=False,
             )
 
+    async def aclose(self) -> None:
+        """Release long-lived resources. Idempotent; no-op by default."""
+
+        return None
+
     @abstractmethod
     async def collect(
         self,
@@ -72,7 +77,16 @@ class Collector(ABC):
 
 
 class HTTPCollector(Collector):
-    """Collector base with shared retry/backoff and rate-limit inspection."""
+    """Collector base with shared retry/backoff and rate-limit inspection.
+
+    One ``httpx.AsyncClient`` is created lazily per collector instance and reused
+    for the instance lifetime. Constructing a client costs hundreds of
+    milliseconds (it builds a fresh SSLContext from the certifi CA bundle) and is
+    fully synchronous, so building one per request blocks the event loop and
+    defeats the runtime's ``asyncio.gather`` over sources. Call :meth:`aclose` on
+    shutdown to release an instance-owned client; a caller-injected ``client=``
+    stays the caller's responsibility and is never closed here.
+    """
 
     def __init__(
         self,
@@ -84,6 +98,7 @@ class HTTPCollector(Collector):
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._client = client
+        self._owns_client = client is None
         self._timeout = timeout
         self._user_agent = user_agent
         self._retry_policy = retry_policy or RetryPolicy()
@@ -94,18 +109,44 @@ class HTTPCollector(Collector):
     def rate_limit(self) -> RateLimitSnapshot | None:
         return self._rate_limit
 
-    @asynccontextmanager
-    async def http_client(self) -> AsyncIterator[httpx.AsyncClient]:
-        if self._client is not None:
-            yield self._client
-            return
-
-        async with httpx.AsyncClient(
+    def _build_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
             timeout=self._timeout,
             headers={"User-Agent": self._user_agent},
             follow_redirects=True,
-        ) as client:
-            yield client
+        )
+
+    def _ensure_client(self) -> httpx.AsyncClient:
+        client = self._client
+        if client is None:
+            client = self._build_client()
+            self._client = client
+            self._owns_client = True
+        return client
+
+    @asynccontextmanager
+    async def http_client(self) -> AsyncIterator[httpx.AsyncClient]:
+        """Yield this instance's cached client, creating it on first use.
+
+        The client deliberately outlives the ``async with`` block: closing it per
+        request forces a new SSLContext (and certifi bundle load) on every poll.
+        """
+
+        yield self._ensure_client()
+
+    async def aclose(self) -> None:
+        """Close the instance-owned client. Idempotent, and safe if none exists.
+
+        A client supplied through ``client=`` belongs to the caller and is left
+        open.
+        """
+
+        if not self._owns_client:
+            return
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
 
     async def request(
         self,

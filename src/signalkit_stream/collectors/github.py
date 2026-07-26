@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 import os
 from typing import Any, Mapping
@@ -17,8 +18,17 @@ from signalkit_stream.protocol import (
 )
 
 
+DEFAULT_COMMENT_CONCURRENCY = 6
+
+
 class GitHubCollector(HTTPCollector):
-    """Incrementally search GitHub issues/PRs and optionally collect comments."""
+    """Incrementally search GitHub issues/PRs and optionally collect comments.
+
+    Comment fetches fan out under a small bounded semaphore instead of running
+    sequentially inside the item loop: with limit=100 the sequential shape held the
+    runtime's per-source concurrency slot for ~100 round trips, starving every other
+    source. Event order is unchanged - each item is still followed by its own comments.
+    """
 
     API_ROOT = "https://api.github.com"
 
@@ -29,6 +39,7 @@ class GitHubCollector(HTTPCollector):
         token: str | None = None,
         include_comments: bool = False,
         comments_per_item: int = 5,
+        comment_concurrency: int = DEFAULT_COMMENT_CONCURRENCY,
         client: httpx.AsyncClient | None = None,
         timeout: float = 20.0,
         retry_policy: RetryPolicy | None = None,
@@ -41,6 +52,9 @@ class GitHubCollector(HTTPCollector):
         self.token = token or os.getenv("GITHUB_TOKEN")
         self.include_comments = include_comments
         self.comments_per_item = max(0, comments_per_item)
+        if comment_concurrency < 1:
+            raise ValueError("GitHub comment_concurrency must be >= 1")
+        self.comment_concurrency = comment_concurrency
         self.source = "github"
         self.instance = instance or self._instance_for_query(query)
 
@@ -96,24 +110,27 @@ class GitHubCollector(HTTPCollector):
             for item in selected_items:
                 if not isinstance(item, dict):
                     raise self._parse_error("GitHub search item must be a JSON object")
-            events: list[SignalEvent] = []
             batch_watermark_time = watermark_time
+            primary_events: list[SignalEvent] = []
             for item in selected_items:
                 event = self._item_event(item)
-                events.append(event)
+                primary_events.append(event)
                 timestamp = event.updated_at or event.created_at
                 if batch_watermark_time is None or timestamp > batch_watermark_time:
                     batch_watermark_time = timestamp
-                if self.include_comments and self.comments_per_item and item.get("comments"):
-                    events.extend(
-                        await self._comments(
-                            client,
-                            item=item,
-                            parent_event_id=event.id,
-                            headers=headers,
-                            context=ctx,
-                        )
-                    )
+
+            comment_batches = await self._comment_batches(
+                client,
+                items=selected_items,
+                parents=primary_events,
+                headers=headers,
+                context=ctx,
+            )
+
+        events: list[SignalEvent] = []
+        for event, comments in zip(primary_events, comment_batches, strict=True):
+            events.append(event)
+            events.extend(comments)
 
         end_offset = offset + len(selected_items)
         page_has_unprocessed = end_offset < len(items)
@@ -195,6 +212,45 @@ class GitHubCollector(HTTPCollector):
                 "labels": labels,
             },
         )
+
+    async def _comment_batches(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        items: list[dict[str, Any]],
+        parents: list[SignalEvent],
+        headers: dict[str, str],
+        context: CollectorContext,
+    ) -> list[list[SignalEvent]]:
+        """Fetch every item's comments concurrently, bounded and order-preserving."""
+
+        if not (self.include_comments and self.comments_per_item):
+            return [[] for _ in items]
+
+        semaphore = asyncio.Semaphore(self.comment_concurrency)
+
+        async def fetch(item: dict[str, Any], parent: SignalEvent) -> list[SignalEvent]:
+            if not item.get("comments"):
+                return []
+            async with semaphore:
+                return await self._comments(
+                    client,
+                    item=item,
+                    parent_event_id=parent.id,
+                    headers=headers,
+                    context=context,
+                )
+
+        results = await asyncio.gather(
+            *(fetch(item, parent) for item, parent in zip(items, parents, strict=True)),
+            return_exceptions=True,
+        )
+        batches: list[list[SignalEvent]] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            batches.append(result)
+        return batches
 
     async def _comments(
         self,

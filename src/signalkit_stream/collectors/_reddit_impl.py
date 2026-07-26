@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Mapping
 from urllib.parse import quote
@@ -16,6 +17,8 @@ from signalkit_stream.protocol import (
     Cursor,
     RateLimitSnapshot,
 )
+
+DEFAULT_COMMENT_CONCURRENCY = 6
 
 RedditListing = Literal["new", "hot", "top", "rising"]
 RedditTimeFilter = Literal["hour", "day", "week", "month", "year", "all"]
@@ -44,6 +47,7 @@ class RedditCollector(HTTPCollector):
         time_filter: RedditTimeFilter | None = None,
         include_comments: bool = False,
         comments_per_post: int = 0,
+        comment_concurrency: int = DEFAULT_COMMENT_CONCURRENCY,
         seen_window: int = 500,
         instance: str | None = None,
         client: httpx.AsyncClient | None = None,
@@ -87,6 +91,7 @@ class RedditCollector(HTTPCollector):
         self.time_filter = time_filter
         self.include_comments = include_comments
         self.comments_per_post = max(0, min(comments_per_post, 100))
+        self.comment_concurrency = comment_concurrency
         self.seen_window = max(50, seen_window)
         self.source = "reddit"
         self.instance = instance or f"r-{self.subreddit}-{self.listing}"
@@ -141,7 +146,7 @@ class RedditCollector(HTTPCollector):
             if not isinstance(children, list):
                 raise self._parse_error("Reddit listing children must be a list")
 
-            events: list[SignalEvent] = []
+            posts: list[tuple[Mapping[str, Any], str, SignalEvent]] = []
             processed_ids: list[str] = []
             primary_count = 0
             warnings: list[str] = []
@@ -165,21 +170,27 @@ class RedditCollector(HTTPCollector):
                     continue
 
                 post = self._post_event(data, fullname=fullname)
-                events.append(post)
+                posts.append((data, fullname, post))
                 processed_ids.append(fullname)
-                if self.include_comments and self.comments_per_post:
-                    comment_events, truncated = await self._comments(
-                        client,
-                        token=token,
-                        post=data,
-                        parent_event_id=post.id,
-                        context=ctx,
-                    )
-                    events.extend(comment_events)
-                    if truncated:
-                        warnings.append(
-                            f"Reddit comments truncated for post {fullname}; only top-level comments are collected"
-                        )
+
+            comment_batches = await self._comment_batches(
+                client,
+                token=token,
+                posts=posts,
+                context=ctx,
+            )
+
+        events: list[SignalEvent] = []
+        for (_, fullname, post), (comment_events, truncated) in zip(
+            posts, comment_batches, strict=True
+        ):
+            events.append(post)
+            events.extend(comment_events)
+            if truncated:
+                warnings.append(
+                    f"Reddit comments truncated for post {fullname}; "
+                    "only top-level comments are collected"
+                )
 
         response_after = _optional_text(listing_data.get("after"))
         next_after = None if reached_watermark else response_after
@@ -245,6 +256,48 @@ class RedditCollector(HTTPCollector):
         self._access_token = token
         self._token_expires_at = now + timedelta(seconds=max(0.0, expires_in))
         return token
+
+    async def _comment_batches(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        token: str,
+        posts: list[tuple[Mapping[str, Any], str, SignalEvent]],
+        context: CollectorContext,
+    ) -> list[tuple[list[SignalEvent], bool]]:
+        """Fetch each post's comments concurrently, bounded and order-preserving.
+
+        ``await self._comments(...)`` used to run inside the per-post loop, so a poll with
+        ``limit=100`` serialized ~100 round trips while holding the runtime's per-source
+        concurrency slot. ``comment_concurrency`` keeps the fan-out small enough for
+        Reddit's per-app rate limits.
+        """
+
+        if not (self.include_comments and self.comments_per_post):
+            return [([], False) for _ in posts]
+
+        semaphore = asyncio.Semaphore(self.comment_concurrency)
+
+        async def fetch(post: Mapping[str, Any], parent: SignalEvent) -> tuple[list[SignalEvent], bool]:
+            async with semaphore:
+                return await self._comments(
+                    client,
+                    token=token,
+                    post=post,
+                    parent_event_id=parent.id,
+                    context=context,
+                )
+
+        results = await asyncio.gather(
+            *(fetch(data, post) for data, _, post in posts),
+            return_exceptions=True,
+        )
+        batches: list[tuple[list[SignalEvent], bool]] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            batches.append(result)
+        return batches
 
     async def _comments(
         self,

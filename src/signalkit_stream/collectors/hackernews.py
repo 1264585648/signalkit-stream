@@ -17,6 +17,8 @@ from signalkit_stream.protocol import (
     Cursor,
 )
 
+DEFAULT_COMMENT_CONCURRENCY = 6
+
 HNFeed = Literal[
     "topstories",
     "newstories",
@@ -38,6 +40,7 @@ class HackerNewsCollector(HTTPCollector):
         feed: HNFeed = "newstories",
         include_comments: bool = False,
         comments_per_story: int = 3,
+        comment_concurrency: int = DEFAULT_COMMENT_CONCURRENCY,
         client: httpx.AsyncClient | None = None,
         timeout: float = 20.0,
         retry_policy: RetryPolicy | None = None,
@@ -47,6 +50,9 @@ class HackerNewsCollector(HTTPCollector):
         self.feed = feed
         self.include_comments = include_comments
         self.comments_per_story = max(0, comments_per_story)
+        if comment_concurrency < 1:
+            raise ValueError("Hacker News comment_concurrency must be >= 1")
+        self.comment_concurrency = comment_concurrency
         self.seen_window = max(50, seen_window)
         self.source = "hackernews"
         self.instance = feed
@@ -85,31 +91,32 @@ class HackerNewsCollector(HTTPCollector):
                 *(self._get_item(client, story_id, context=ctx) for story_id in story_ids)
             )
 
-            events: list[SignalEvent] = []
             processed_ids: list[int] = []
+            live_stories: list[tuple[dict[str, Any], SignalEvent]] = []
             for story_id, story in zip(story_ids, stories, strict=True):
                 processed_ids.append(story_id)
                 if not story or story.get("deleted") or story.get("dead"):
                     continue
-                event = self._story_event(story)
-                events.append(event)
-                if self.include_comments and self.comments_per_story:
-                    comment_ids = self._comment_ids(story)
-                    comments = await asyncio.gather(
-                        *(
-                            self._get_item(client, comment_id, context=ctx)
-                            for comment_id in comment_ids
-                        )
-                    )
-                    events.extend(
-                        self._comment_event(
-                            comment,
-                            story_id=self._required_id(story),
-                            parent_event_id=event.id,
-                        )
-                        for comment in comments
-                        if comment and not comment.get("deleted") and not comment.get("dead")
-                    )
+                live_stories.append((story, self._story_event(story)))
+
+            comment_batches = await self._comment_batches(
+                client,
+                stories=[story for story, _ in live_stories],
+                context=ctx,
+            )
+
+        events: list[SignalEvent] = []
+        for (story, event), comments in zip(live_stories, comment_batches, strict=True):
+            events.append(event)
+            events.extend(
+                self._comment_event(
+                    comment,
+                    story_id=self._required_id(story),
+                    parent_event_id=event.id,
+                )
+                for comment in comments
+                if comment and not comment.get("deleted") and not comment.get("dead")
+            )
 
         merged_seen = list(dict.fromkeys([*processed_ids, *seen_ids]))[: self.seen_window]
         next_cursor = Cursor(
@@ -123,6 +130,46 @@ class HackerNewsCollector(HTTPCollector):
             primary_count=len(story_ids),
             rate_limit=self.rate_limit,
         )
+
+    async def _comment_batches(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        stories: list[dict[str, Any]],
+        context: CollectorContext,
+    ) -> list[list[dict[str, Any] | None]]:
+        """Fetch every story's comments in one bounded, order-preserving fan-out.
+
+        The per-story ``gather`` used to sit inside a sequential story loop, so a poll
+        with ``limit=100`` issued ~100 serialized round trips while holding the runtime's
+        per-source concurrency slot. Story/comment pairs are hoisted into a single
+        gather bounded by ``comment_concurrency`` instead.
+        """
+
+        if not (self.include_comments and self.comments_per_story):
+            return [[] for _ in stories]
+
+        pairs = [
+            (index, comment_id)
+            for index, story in enumerate(stories)
+            for comment_id in self._comment_ids(story)
+        ]
+        semaphore = asyncio.Semaphore(self.comment_concurrency)
+
+        async def fetch(comment_id: int) -> dict[str, Any] | None:
+            async with semaphore:
+                return await self._get_item(client, comment_id, context=context)
+
+        results = await asyncio.gather(
+            *(fetch(comment_id) for _, comment_id in pairs),
+            return_exceptions=True,
+        )
+        batches: list[list[dict[str, Any] | None]] = [[] for _ in stories]
+        for (index, _), result in zip(pairs, results, strict=True):
+            if isinstance(result, BaseException):
+                raise result
+            batches[index].append(result)
+        return batches
 
     async def _get_item(
         self,

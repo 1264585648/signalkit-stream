@@ -5,7 +5,10 @@ from typing import Literal, Mapping
 
 import httpx
 
-from signalkit_stream.collectors._reddit_impl import RedditCollector as _RedditCollector
+from signalkit_stream.collectors._reddit_impl import (
+    DEFAULT_COMMENT_CONCURRENCY,
+    RedditCollector as _RedditCollector,
+)
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.protocol import CollectorContext, CollectorError, CollectorErrorKind
 
@@ -40,6 +43,7 @@ class RedditCollector(_RedditCollector):
         time_filter: RedditTimeFilter | None = None,
         include_comments: bool = False,
         comments_per_post: int = 0,
+        comment_concurrency: int = DEFAULT_COMMENT_CONCURRENCY,
         seen_window: int = 500,
         instance: str | None = None,
         client: httpx.AsyncClient | None = None,
@@ -102,6 +106,9 @@ class RedditCollector(_RedditCollector):
         self.time_filter = time_filter
         self.include_comments = include_comments
         self.comments_per_post = max(0, min(comments_per_post, 100))
+        if comment_concurrency < 1:
+            raise ValueError("Reddit comment_concurrency must be >= 1")
+        self.comment_concurrency = comment_concurrency
         self.seen_window = max(50, seen_window)
         self.source = "reddit"
         self.instance = instance or f"r-{self.subreddit}-{self.listing}"

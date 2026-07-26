@@ -3,7 +3,12 @@ import pytest
 
 from signalkit_stream.collectors.github import GitHubCollector
 from signalkit_stream.models import SignalKind
-from signalkit_stream.protocol import CollectorContext
+from signalkit_stream.protocol import (
+    CollectorContext,
+    CollectorError,
+    CollectorErrorKind,
+    Cursor,
+)
 
 
 def issue(number: int, *, comments: int = 0) -> dict:
@@ -82,3 +87,94 @@ async def test_github_cursor_can_resume_inside_same_page() -> None:
 
     assert [event.metadata["number"] for event in first.events] == [1, 2]
     assert [event.metadata["number"] for event in second.events] == [3]
+
+
+@pytest.mark.asyncio
+async def test_github_html_error_page_is_classified_as_parse_error() -> None:
+    """A 200 that serves HTML must not leak a raw JSONDecodeError."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"<html><body>unicorn</body></html>",
+            headers={"Content-Type": "text/html"},
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        collector = GitHubCollector("is:issue", client=client)
+        with pytest.raises(CollectorError) as caught:
+            await collector.collect(context=CollectorContext(limit=2))
+
+    assert caught.value.kind is CollectorErrorKind.PARSE
+    assert caught.value.retryable is False
+    assert "JSON" in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_github_search_payload_must_be_an_object_with_item_list() -> None:
+    for payload in ([1, 2, 3], {"items": {"nope": True}}, {"items": ["not-an-object"]}):
+        def handler(request: httpx.Request, body: object = payload) -> httpx.Response:
+            return httpx.Response(200, json=body, request=request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            collector = GitHubCollector("is:issue", client=client)
+            with pytest.raises(CollectorError) as caught:
+                await collector.collect(context=CollectorContext(limit=2))
+
+        assert caught.value.kind is CollectorErrorKind.PARSE, payload
+
+
+@pytest.mark.asyncio
+async def test_github_malformed_timestamp_is_classified_as_parse_error() -> None:
+    broken = issue(1)
+    broken["created_at"] = "not-a-timestamp"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"total_count": 1, "items": [broken]}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        collector = GitHubCollector("is:issue", client=client)
+        with pytest.raises(CollectorError) as caught:
+            await collector.collect(context=CollectorContext(limit=2))
+
+    assert caught.value.kind is CollectorErrorKind.PARSE
+    assert "not-a-timestamp" in str(caught.value.details)
+
+
+@pytest.mark.asyncio
+async def test_github_comment_html_error_page_is_classified_as_parse_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search/issues":
+            return httpx.Response(
+                200,
+                json={"total_count": 1, "items": [issue(1, comments=1)]},
+                request=request,
+            )
+        return httpx.Response(200, content=b"<html>maintenance</html>", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        collector = GitHubCollector(
+            "is:issue",
+            include_comments=True,
+            comments_per_item=2,
+            client=client,
+        )
+        with pytest.raises(CollectorError) as caught:
+            await collector.collect(context=CollectorContext(limit=2))
+
+    assert caught.value.kind is CollectorErrorKind.PARSE
+
+
+@pytest.mark.asyncio
+async def test_github_corrupt_cursor_watermark_is_classified_as_cursor_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
+        return httpx.Response(200, json={"total_count": 0, "items": []}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        collector = GitHubCollector("is:issue", client=client)
+        cursor = Cursor(collector.identity.key, {"watermark": "yesterday-ish"})
+        with pytest.raises(CollectorError) as caught:
+            await collector.collect(context=CollectorContext(limit=2), cursor=cursor)
+
+    assert caught.value.kind is CollectorErrorKind.CURSOR

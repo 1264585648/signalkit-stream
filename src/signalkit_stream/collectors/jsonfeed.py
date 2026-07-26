@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any, Mapping
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from signalkit_stream.collectors._text import html_to_text
+from signalkit_stream.collectors._text import html_to_text, redact_url, validated_seen_window
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import (
@@ -17,8 +18,20 @@ from signalkit_stream.protocol import (
 )
 
 
+DEFAULT_MAX_PAGE_FOLLOWS = 20
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
 class JSONFeedCollector(HTTPCollector):
-    """Collect JSON Feed 1.x documents, including paginated ``next_url`` feeds."""
+    """Collect JSON Feed 1.x documents, including paginated ``next_url`` feeds.
+
+    ``next_url`` is remote-controlled input: it is resolved against the configured feed
+    URL and only followed when it stays on the same origin (identical scheme, host, and
+    port) as that configured URL. Anything else (another host, another port, a scheme
+    other than http/https) is rejected with a ``PARSE`` error instead of being fetched
+    or persisted into a checkpoint. ``max_page_follows`` additionally bounds how many
+    ``next_url`` hops a single polling cycle may take.
+    """
 
     def __init__(
         self,
@@ -27,6 +40,7 @@ class JSONFeedCollector(HTTPCollector):
         source: str = "jsonfeed",
         instance: str | None = None,
         seen_window: int = 500,
+        max_page_follows: int = DEFAULT_MAX_PAGE_FOLLOWS,
         client: httpx.AsyncClient | None = None,
         timeout: float = 20.0,
         retry_policy: RetryPolicy | None = None,
@@ -35,11 +49,15 @@ class JSONFeedCollector(HTTPCollector):
             raise ValueError("JSON Feed URL must not be empty")
         if not source.strip():
             raise ValueError("JSON Feed source must not be empty")
+        if max_page_follows < 0:
+            raise ValueError("JSON Feed max_page_follows must be >= 0")
         super().__init__(client=client, timeout=timeout, retry_policy=retry_policy)
-        self.url = url
+        self.url = url.strip()
         self.source = source
-        self.instance = instance or url
-        self.seen_window = max(50, seen_window)
+        self.exported_url = redact_url(self.url)
+        self.instance = instance or self.exported_url
+        self.seen_window = validated_seen_window(seen_window, label="JSON Feed")
+        self.max_page_follows = max_page_follows
 
     async def collect(
         self,
@@ -51,9 +69,16 @@ class JSONFeedCollector(HTTPCollector):
         self.validate_cursor(cursor)
         state = dict(cursor.state) if cursor else {}
         page_url = _optional_text(state.get("page_url"))
+        if page_url is not None:
+            page_url = self._checked_page_url(
+                page_url,
+                field="page_url",
+                kind=CollectorErrorKind.CURSOR,
+            )
         item_offset = max(0, int(state.get("item_offset", 0))) if page_url else 0
         request_url = page_url or self.url
         starting_new_cycle = page_url is None
+        page_follows = 0 if starting_new_cycle else max(0, int(state.get("page_follows", 0)))
         prior_seen = [str(value) for value in state.get("seen_ids", []) if str(value)]
         prior_seen_set = set(prior_seen)
         watermark_ids = (
@@ -150,16 +175,33 @@ class JSONFeedCollector(HTTPCollector):
             if primary_count >= ctx.limit:
                 break
 
-        response_next_url = _optional_text(payload.get("next_url"))
+        raw_next_url = _optional_text(payload.get("next_url"))
+        response_next_url = (
+            self._checked_page_url(
+                raw_next_url,
+                field="next_url",
+                kind=CollectorErrorKind.PARSE,
+            )
+            if raw_next_url
+            else None
+        )
+        next_page_follows = page_follows
         if reached_watermark:
             cursor_page_url = None
             cursor_offset = 0
         elif next_offset < len(raw_items):
             cursor_page_url = request_url
             cursor_offset = next_offset
+        elif response_next_url and page_follows >= self.max_page_follows:
+            warnings.append(
+                f"stopped following JSON Feed next_url after {page_follows} pages in one cycle"
+            )
+            cursor_page_url = None
+            cursor_offset = 0
         elif response_next_url:
             cursor_page_url = response_next_url
             cursor_offset = 0
+            next_page_follows = page_follows + 1
         else:
             cursor_page_url = None
             cursor_offset = 0
@@ -183,6 +225,7 @@ class JSONFeedCollector(HTTPCollector):
         }
         if has_more:
             next_state["watermark_ids"] = watermark_ids
+            next_state["page_follows"] = next_page_follows
 
         return CollectorResult(
             events=events,
@@ -210,7 +253,7 @@ class JSONFeedCollector(HTTPCollector):
             _optional_text(item.get("url"))
             or _optional_text(item.get("external_url"))
             or feed_home
-            or self.url
+            or self.exported_url
         )
         published = _parse_time(item.get("date_published"))
         modified = _parse_time(item.get("date_modified"))
@@ -237,7 +280,7 @@ class JSONFeedCollector(HTTPCollector):
             updated_at=modified,
             metadata={
                 "external_id": external_id,
-                "feed_url": self.url,
+                "feed_url": self.exported_url,
                 "feed_title": feed_title,
                 "external_url": item.get("external_url"),
                 "authors": authors,
@@ -245,6 +288,66 @@ class JSONFeedCollector(HTTPCollector):
                 "language": item.get("language"),
                 "attachments": attachments,
             },
+        )
+
+    def _checked_page_url(
+        self,
+        candidate: str,
+        *,
+        field: str,
+        kind: CollectorErrorKind,
+    ) -> str:
+        """Return ``candidate`` resolved against the feed URL, or raise if off-origin.
+
+        Pagination targets come from the remote feed (or from a checkpoint that a remote
+        feed populated earlier), so they are never trusted: only http/https URLs on the
+        configured feed's own origin may be requested. This is the control that stops a
+        feed operator or an on-path attacker from turning the collector into an SSRF
+        probe against link-local or private endpoints.
+        """
+
+        resolved = urljoin(self.url, candidate)
+        target = urlsplit(resolved)
+        base = urlsplit(self.url)
+        if target.scheme.lower() not in _DEFAULT_PORTS:
+            raise self._page_url_error(
+                f"JSON Feed {field} must use http or https",
+                candidate=candidate,
+                resolved=resolved,
+                kind=kind,
+            )
+        target_origin = _origin(target)
+        base_origin = _origin(base)
+        if target_origin is None:
+            raise self._page_url_error(
+                f"JSON Feed {field} is not a usable http(s) URL",
+                candidate=candidate,
+                resolved=resolved,
+                kind=kind,
+            )
+        if target_origin != base_origin:
+            raise self._page_url_error(
+                f"JSON Feed {field} must stay on the feed origin {_origin_text(base_origin)}",
+                candidate=candidate,
+                resolved=resolved,
+                kind=kind,
+            )
+        return resolved
+
+    def _page_url_error(
+        self,
+        message: str,
+        *,
+        candidate: str,
+        resolved: str,
+        kind: CollectorErrorKind,
+    ) -> CollectorError:
+        return CollectorError(
+            message,
+            kind=kind,
+            source_key=self.identity.key,
+            retryable=False,
+            details={"rejected_url": candidate, "resolved_url": resolved},
         )
 
     def _json_object(self, response: httpx.Response) -> Mapping[str, Any]:
@@ -273,6 +376,29 @@ class JSONFeedCollector(HTTPCollector):
     ) -> list[str]:
         values = [*processed, *prior] if prepend else [*prior, *processed]
         return list(dict.fromkeys(values))[: self.seen_window]
+
+
+def _origin(parts: Any) -> tuple[str, str, int | None] | None:
+    """Return a normalized ``(scheme, host, port)`` origin, or ``None`` when malformed."""
+
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if not host or scheme not in _DEFAULT_PORTS:
+        return None
+    return scheme, host, port or _DEFAULT_PORTS[scheme]
+
+
+def _origin_text(origin: tuple[str, str, int | None] | None) -> str:
+    if origin is None:
+        return "the configured feed origin"
+    scheme, host, port = origin
+    if port == _DEFAULT_PORTS.get(scheme):
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"
 
 
 def _optional_text(value: object) -> str | None:

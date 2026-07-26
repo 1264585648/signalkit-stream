@@ -6,6 +6,7 @@ from typing import Any, Literal, Mapping
 
 import httpx
 
+from signalkit_stream.collectors._text import redact_url, validated_seen_window
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import (
@@ -83,8 +84,7 @@ class GenericRESTCollector(HTTPCollector):
                 raise ValueError("REST cursor_param must not be empty for cursor pagination")
             if not next_cursor_path or not next_cursor_path.strip():
                 raise ValueError("REST next_cursor_path is required for cursor pagination")
-        if seen_window < 100:
-            raise ValueError("REST seen_window must be >= 100")
+        seen_window = validated_seen_window(seen_window, label="REST")
 
         super().__init__(client=client, timeout=timeout, retry_policy=retry_policy)
         self.url = url
@@ -92,7 +92,8 @@ class GenericRESTCollector(HTTPCollector):
         self.id_path = id_path
         self.kind = kind
         self.source = source
-        self.instance = instance or url
+        self.exported_url = redact_url(url)
+        self.instance = instance or self.exported_url
         self.title_path = _clean_path(title_path)
         self.content_path = _clean_path(content_path)
         self.author_path = _clean_path(author_path)
@@ -274,7 +275,7 @@ class GenericRESTCollector(HTTPCollector):
         content_value = self._field(item, self.content_path)
         content = _to_text(content_value) if content_value is not _MISSING else ""
         author = self._field_text(item, self.author_path)
-        item_url = self._field_text(item, self.url_path) or self.url
+        item_url = self._field_text(item, self.url_path) or self.exported_url
         created_at = self._field_datetime(item, self.created_at_path) or datetime.fromtimestamp(0, tz=UTC)
         updated_at = self._field_datetime(item, self.updated_at_path)
         metadata: dict[str, Any] = {"external_id": external_id}

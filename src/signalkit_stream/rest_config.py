@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Mapping
 
+from signalkit_stream.collectors._text import MIN_SEEN_WINDOW
 from signalkit_stream.collectors.rest import GenericRESTCollector
 from signalkit_stream.config import SourceConfig
 from signalkit_stream.models import SignalKind
@@ -116,8 +117,19 @@ def build_generic_rest_collector(config: SourceConfig) -> GenericRESTCollector:
             "initial_backfill",
             config,
         ),
-        seen_window=_integer(options.get("seen_window", 2000), "seen_window", config),
+        seen_window=_seen_window(options.get("seen_window", 2000), config),
     )
+
+
+def _seen_window(value: Any, config: SourceConfig) -> int:
+    """Validate the shared dedup-window floor with the offending source named."""
+
+    parsed = _integer(value, "seen_window", config)
+    if parsed < MIN_SEEN_WINDOW:
+        raise ValueError(
+            f"source {config.name!r}: seen_window must be >= {MIN_SEEN_WINDOW}"
+        )
+    return parsed
 
 
 def _required_string(options: Mapping[str, Any], key: str, config: SourceConfig) -> str:

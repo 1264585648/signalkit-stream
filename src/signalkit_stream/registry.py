@@ -4,6 +4,7 @@ from collections.abc import Callable
 import os
 from typing import Any, Mapping
 
+from signalkit_stream.collectors._text import MIN_SEEN_WINDOW
 from signalkit_stream.collectors import (
     Collector,
     GitHubCollector,
@@ -68,7 +69,7 @@ def _jsonfeed_factory(config: SourceConfig) -> Collector:
     options = dict(config.options)
     _reject_unknown(options, {"url", "source", "instance", "seen_window"}, config)
     url = _required_string(options, "url", config)
-    seen_window = _positive_int(options.get("seen_window", 500), "seen_window", config)
+    seen_window = _seen_window(options.get("seen_window", 500), config)
     return JSONFeedCollector(
         url,
         source=str(options.get("source", "jsonfeed")),
@@ -81,7 +82,7 @@ def _hackernews_factory(config: SourceConfig) -> Collector:
     options = dict(config.options)
     _reject_unknown(options, {"feed", "comments", "seen_window"}, config)
     comments = _nonnegative_int(options.get("comments", 0), "comments", config)
-    seen_window = _positive_int(options.get("seen_window", 500), "seen_window", config)
+    seen_window = _seen_window(options.get("seen_window", 500), config)
     feed = str(options.get("feed", "newstories"))
     allowed = {
         "topstories",
@@ -141,7 +142,7 @@ def _reddit_factory(config: SourceConfig) -> Collector:
     listing = str(options.get("listing", "new")).strip().lower()
     time_filter = _optional_string(options.get("time_filter"))
     comments = _nonnegative_int(options.get("comments", 0), "comments", config)
-    seen_window = _positive_int(options.get("seen_window", 500), "seen_window", config)
+    seen_window = _seen_window(options.get("seen_window", 500), config)
 
     access_token = _optional_environment(
         options.get("access_token_env", "REDDIT_ACCESS_TOKEN"),
@@ -250,6 +251,17 @@ def _nonnegative_int(value: Any, key: str, config: SourceConfig) -> int:
     parsed = _integer(value, key, config)
     if parsed < 0:
         raise ValueError(f"source {config.name!r}: {key} must be >= 0")
+    return parsed
+
+
+def _seen_window(value: Any, config: SourceConfig) -> int:
+    """Validate the shared dedup-window floor with the offending source named."""
+
+    parsed = _integer(value, "seen_window", config)
+    if parsed < MIN_SEEN_WINDOW:
+        raise ValueError(
+            f"source {config.name!r}: seen_window must be >= {MIN_SEEN_WINDOW}"
+        )
     return parsed
 
 

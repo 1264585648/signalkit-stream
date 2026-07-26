@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from signalkit_stream.collectors.rss import RSSCollector
-from signalkit_stream.protocol import CollectorContext
+from signalkit_stream.protocol import CollectorContext, CollectorError, CollectorErrorKind
 from signalkit_stream.models import SignalKind
 
 
@@ -82,3 +82,69 @@ async def test_rss_uses_conditional_get_after_feed_is_drained() -> None:
 
     assert second.events == []
     assert second.cursor == first.cursor
+
+
+BILLION_LAUGHS = b"""<?xml version="1.0"?>
+<!DOCTYPE lolz [
+  <!ENTITY lol "lol">
+  <!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+  <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">
+  <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+  <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">
+  <!ENTITY lol5 "&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;">
+  <!ENTITY lol6 "&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;">
+  <!ENTITY lol7 "&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;">
+  <!ENTITY lol8 "&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;">
+  <!ENTITY lol9 "&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;">
+]>
+<rss version="2.0"><channel><title>&lol9;</title>
+<item><guid>g</guid><title>&lol9;</title><link>https://example.com/1</link></item>
+</channel></rss>"""
+
+EXTERNAL_ENTITY = b"""<?xml version="1.0"?>
+<!DOCTYPE feed [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+<rss version="2.0"><channel><title>&xxe;</title></channel></rss>"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [BILLION_LAUGHS, EXTERNAL_ENTITY], ids=["billion-laughs", "xxe"])
+async def test_rss_rejects_dtd_declarations_before_parsing(payload: bytes) -> None:
+    """The adapter, not expat's amplification cap, must reject entity payloads.
+
+    Billion laughs is only mitigated by libexpat >= 2.6.0 and the project floor is
+    CPython 3.11, so the DTD is refused up front: no legitimate RSS/Atom feed needs one.
+    """
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=payload))
+    async with httpx.AsyncClient(transport=transport) as client:
+        collector = RSSCollector("https://example.com/feed.xml", client=client)
+        with pytest.raises(CollectorError) as caught:
+            await collector.collect()
+
+    assert caught.value.kind is CollectorErrorKind.PARSE
+    assert caught.value.retryable is False
+    assert "DOCTYPE" in str(caught.value)
+    # Our own guard raised this: no expat ParseError was involved.
+    assert caught.value.__cause__ is None
+    assert caught.value.details.get("declaration") == "DOCTYPE"
+
+
+@pytest.mark.asyncio
+async def test_rss_still_accepts_a_doctype_like_string_inside_item_content() -> None:
+    payload = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Web tips</title>
+<item>
+  <guid>item-1</guid><title>Use the short doctype</title>
+  <link>https://example.com/posts/1</link>
+  <description><![CDATA[Always start pages with <!DOCTYPE html>.]]></description>
+  <pubDate>Wed, 01 Jul 2026 10:00:00 GMT</pubDate>
+</item>
+</channel></rss>"""
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=payload))
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await RSSCollector("https://example.com/feed.xml", client=client).collect()
+
+    assert len(result.events) == 1
+    assert result.events[0].title == "Use the short doctype"
+    assert result.events[0].content.startswith("Always start pages with")

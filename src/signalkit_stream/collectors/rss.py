@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import codecs
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+import re
 from xml.etree import ElementTree as ET
 
 import httpx
 
-from signalkit_stream.collectors._text import html_to_text
+from signalkit_stream.collectors._text import html_to_text, redact_url
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import CollectorContext, CollectorError, CollectorErrorKind, CollectorResult, Cursor
@@ -28,7 +30,8 @@ class RSSCollector(HTTPCollector):
         super().__init__(client=client, timeout=timeout, retry_policy=retry_policy)
         self.url = url
         self.source = source
-        self.instance = instance or url
+        self.exported_url = redact_url(url)
+        self.instance = instance or self.exported_url
 
     async def collect(
         self,
@@ -60,9 +63,18 @@ class RSSCollector(HTTPCollector):
 
         try:
             feed_title, entries = self._parse_feed(response.content)
+        except _DTDForbidden as exc:
+            raise CollectorError(
+                f"feed {self.exported_url} declares a {exc.declaration} document type "
+                "definition, which this adapter refuses to parse",
+                kind=CollectorErrorKind.PARSE,
+                source_key=self.identity.key,
+                retryable=False,
+                details={"declaration": exc.declaration},
+            ) from None
         except (ET.ParseError, ValueError) as exc:
             raise CollectorError(
-                f"failed to parse feed {self.url}: {exc}",
+                f"failed to parse feed {self.exported_url}: {exc}",
                 kind=CollectorErrorKind.PARSE,
                 source_key=self.identity.key,
                 retryable=False,
@@ -71,7 +83,7 @@ class RSSCollector(HTTPCollector):
         selected_entries = entries[offset : offset + ctx.limit]
         events: list[SignalEvent] = []
         for entry in selected_entries:
-            link = str(entry["link"] or self.url)
+            link = str(entry["link"] or self.exported_url)
             title = html_to_text(str(entry["title"] or "")) or None
             content = html_to_text(str(entry["content"] or entry["title"] or ""))
             external_id = str(entry["id"] or link or title or len(events))
@@ -95,7 +107,7 @@ class RSSCollector(HTTPCollector):
                     created_at=created_at,
                     updated_at=updated_at,
                     metadata={
-                        "feed_url": self.url,
+                        "feed_url": self.exported_url,
                         "feed_title": feed_title,
                         "tags": entry["tags"],
                         "external_id": external_id,
@@ -124,6 +136,7 @@ class RSSCollector(HTTPCollector):
 
     @classmethod
     def _parse_feed(cls, payload: bytes) -> tuple[str | None, list[dict[str, object]]]:
+        _reject_dtd(payload)
         root = ET.fromstring(payload)
         root_name = cls._local_name(root.tag)
         if root_name == "rss":
@@ -239,3 +252,45 @@ class RSSCollector(HTTPCollector):
         if not value:
             return None
         return cls._parse_time(value)
+
+
+class _DTDForbidden(ValueError):
+    """Raised when a feed body carries a DTD/entity declaration."""
+
+    def __init__(self, declaration: str) -> None:
+        super().__init__(f"feed declares a {declaration}")
+        self.declaration = declaration
+
+
+_ROOT_ELEMENT = re.compile(r"<[A-Za-z_]")
+_DECLARATIONS = (("<!doctype", "DOCTYPE"), ("<!entity", "ENTITY"))
+
+
+def _reject_dtd(payload: bytes) -> None:
+    """Refuse feed bodies whose prolog declares a DTD or an entity.
+
+    Billion laughs is only mitigated by the amplification cap in libexpat >= 2.6.0.
+    ``requires-python = ">=3.11"`` guarantees no such floor (CPython 3.11.0-3.11.8 and
+    distro builds linked against an older libexpat ship without it), so the DTD subset
+    is refused before ElementTree ever sees it. No legitimate RSS/Atom feed needs one.
+
+    Only the prolog is inspected, so a literal ``<!DOCTYPE html>`` inside item content
+    or a CDATA section is still collected normally.
+    """
+
+    prolog = _prolog(payload)
+    for marker, declaration in _DECLARATIONS:
+        if marker in prolog:
+            raise _DTDForbidden(declaration)
+
+
+def _prolog(payload: bytes) -> str:
+    """Return the lower-cased markup that precedes the root element."""
+
+    if payload.startswith(codecs.BOM_UTF16_LE) or payload.startswith(codecs.BOM_UTF16_BE):
+        text = payload.decode("utf-16", errors="replace")
+    else:
+        body = payload[3:] if payload.startswith(codecs.BOM_UTF8) else payload
+        text = body.decode("latin-1", errors="replace")
+    match = _ROOT_ELEMENT.search(text)
+    return (text[: match.start()] if match else text).lower()

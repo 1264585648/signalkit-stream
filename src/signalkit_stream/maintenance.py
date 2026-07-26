@@ -16,6 +16,7 @@ from signalkit_stream.migrations import (
     get_database_schema_version,
     validate_database_schema,
 )
+from signalkit_stream.sqlite_ops import _sqlite_uri
 
 
 @dataclass(slots=True, frozen=True)
@@ -77,7 +78,7 @@ def backup_database(
     if not destination_path.parent.exists():
         raise FileNotFoundError(destination_path.parent)
 
-    source_uri = f"file:{source_path.resolve().as_posix()}?mode=ro"
+    source_uri = _sqlite_uri(source_path, mode="ro")
     temp_path: Path | None = None
     source_connection = sqlite3.connect(source_uri, uri=True, timeout=1.0)
     try:
@@ -125,7 +126,7 @@ def verify_database(path: str | Path) -> VerifyResult:
     if not database.exists() or not database.is_file():
         raise FileNotFoundError(database)
 
-    uri = f"file:{database.resolve().as_posix()}?mode=ro"
+    uri = _sqlite_uri(database, mode="ro")
     connection = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         quick_check = _quick_check(connection)

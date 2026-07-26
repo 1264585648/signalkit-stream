@@ -9,6 +9,7 @@ import sqlite3
 from typing import Sequence
 
 from signalkit_stream.maintenance import verify_database
+from signalkit_stream.sqlite_ops import _sqlite_uri
 
 
 @dataclass(slots=True, frozen=True)
@@ -65,7 +66,7 @@ def read_snapshot(path: str | Path) -> StreamSnapshot:
 
     database = Path(path).expanduser()
     verification = verify_database(database)
-    uri = f"file:{database.resolve().as_posix()}?mode=ro"
+    uri = _sqlite_uri(database, mode="ro")
     connection = sqlite3.connect(uri, uri=True, timeout=0.5)
     connection.row_factory = sqlite3.Row
     try:

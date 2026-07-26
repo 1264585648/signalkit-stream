@@ -3,6 +3,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
+from urllib.parse import quote
+
+
+def _sqlite_uri(path: Path, *, mode: str) -> str:
+    """Build a SQLite ``file:`` URI that survives ``%``, spaces, and UNC paths.
+
+    SQLite percent-decodes URI paths, so an unescaped ``%`` in a directory name resolves
+    to a different (usually missing) file. It also treats the text between the first two
+    and third slash as a URI authority, so the two leading slashes of a Windows UNC path
+    must be escaped by a third one. This module owns the helper because it has no
+    first-party imports, so every SQLite entry point can share it without an import cycle.
+    """
+
+    text = path.resolve().as_posix()
+    if text.startswith("//"):
+        text = "//" + text  # UNC //server/share -> ////server/share
+    elif text.startswith("/"):
+        text = "//" + text  # POSIX /var/lib -> ///var/lib
+    else:
+        text = "///" + text  # drive-letter C:/data -> ///C:/data
+    return f"file:{quote(text, safe='/:')}?mode={mode}"
 
 
 @dataclass(slots=True, frozen=True)
@@ -31,7 +52,7 @@ def probe_write_lock(
         raise ValueError("SQLite lock probe timeout must be >= 0")
 
     database = Path(path).expanduser()
-    uri = f"file:{database.resolve().as_posix()}?mode=rw"
+    uri = _sqlite_uri(database, mode="rw")
     connection: sqlite3.Connection | None = None
     journal_mode: str | None = None
     busy_timeout_ms: int | None = None

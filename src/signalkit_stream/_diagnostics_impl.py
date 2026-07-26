@@ -10,6 +10,7 @@ from typing import Any
 from signalkit_stream.config import StreamConfig, load_config
 from signalkit_stream.registry import CollectorRegistry, default_registry
 from signalkit_stream.sinks import SinkRegistry, default_sink_registry
+from signalkit_stream.sqlite_ops import _sqlite_uri
 
 
 class DiagnosticStatus(StrEnum):
@@ -253,7 +254,7 @@ def _database_checks(database: str) -> list[DiagnosticCheck]:
         )
         return checks
 
-    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    uri = _sqlite_uri(path, mode="ro")
     try:
         connection = sqlite3.connect(uri, uri=True)
         connection.row_factory = sqlite3.Row

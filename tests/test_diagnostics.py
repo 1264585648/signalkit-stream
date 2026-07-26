@@ -2,6 +2,7 @@ from pathlib import Path
 
 from signalkit_stream.config import sample_config
 from signalkit_stream.diagnostics import DiagnosticStatus, doctor, validate_config_file
+from signalkit_stream.migrations import DATABASE_SCHEMA_VERSION
 from signalkit_stream.storage import SQLiteSignalStore
 
 
@@ -97,7 +98,8 @@ def test_doctor_warns_before_database_exists_then_checks_initialized_database(tm
     )
     schema = next(check for check in after.checks if check.name == "database-schema")
     assert schema.status is DiagnosticStatus.PASS
-    assert schema.details["user_version"] == 0
+    assert schema.details["user_version"] == DATABASE_SCHEMA_VERSION
+    assert schema.details["supported_version"] == DATABASE_SCHEMA_VERSION
 
 
 def test_validate_invalid_config_is_single_failure(tmp_path) -> None:

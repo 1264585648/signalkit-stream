@@ -50,6 +50,7 @@ _CROSS_ORIGIN_SAFE_HEADERS = frozenset(
         "accept-encoding",
         "accept-language",
         "cache-control",
+        "connection",
         "content-type",
         "if-modified-since",
         "if-none-match",
@@ -183,14 +184,33 @@ class HTTPCollector(Collector):
       event loop. Call :meth:`aclose` on shutdown to release an instance-owned
       client; an injected ``client=`` is never closed here.
     * Response bodies are streamed and capped at ``max_response_bytes``.
-    * Redirects are followed manually: same-origin only by default, with a
-      ``max_redirects`` ceiling. Cross-origin redirects are refused unless
-      ``allow_cross_origin_redirects=True``, and when they are allowed every
-      request header outside a small safe allowlist (plus any ``auth=``) is
-      dropped, because httpx itself only strips ``Authorization``/``Cookie``.
+    * Redirects are followed manually (``follow_redirects=False`` on the client),
+      bounded by ``max_redirects`` and restricted to http/https. httpx strips
+      only ``Authorization`` and ``Cookie`` on a cross-origin hop, so an
+      operator-configured token header (``X-Api-Key``, ``X-Auth-Token``,
+      ``Private-Token``, ...) would otherwise be replayed to whatever host the
+      upstream redirects to. ``cross_origin_redirects`` selects the policy:
+
+      ``"never"``
+          Refuse every cross-origin redirect.
+      ``"anonymous"`` (default)
+          Follow a cross-origin redirect only when the request carries no
+          credentials at all - no ``auth=``, no client-level auth, and no request
+          header outside :data:`_CROSS_ORIGIN_SAFE_HEADERS`. A credentialed
+          request is refused with an actionable error instead of leaking. This
+          keeps anonymous feeds that legitimately hop hosts working (verified:
+          ``http://blog.golang.org/feed.atom`` -> ``https://go.dev/blog/feed.atom``).
+      ``"always"``
+          Follow, dropping every non-allowlisted header, the cookie header and
+          any ``auth=`` credentials.
+
+      Same-origin redirects, and the very common same-host ``http`` -> ``https``
+      upgrade, are always followed with headers intact.
     * Error messages are built from redacted URLs so query-string secrets never
       reach checkpoints, logs or CLI output.
     """
+
+    CROSS_ORIGIN_REDIRECT_POLICIES = ("never", "anonymous", "always")
 
     def __init__(
         self,
@@ -202,12 +222,17 @@ class HTTPCollector(Collector):
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
-        allow_cross_origin_redirects: bool = False,
+        cross_origin_redirects: str = "anonymous",
     ) -> None:
         if max_response_bytes < 1:
             raise ValueError("max_response_bytes must be >= 1")
         if max_redirects < 0:
             raise ValueError("max_redirects must be >= 0")
+        if cross_origin_redirects not in self.CROSS_ORIGIN_REDIRECT_POLICIES:
+            raise ValueError(
+                "cross_origin_redirects must be one of "
+                + ", ".join(self.CROSS_ORIGIN_REDIRECT_POLICIES)
+            )
 
         self._client = client
         self._owns_client = client is None
@@ -218,7 +243,7 @@ class HTTPCollector(Collector):
         self._rate_limit: RateLimitSnapshot | None = None
         self._max_response_bytes = int(max_response_bytes)
         self._max_redirects = int(max_redirects)
-        self._allow_cross_origin_redirects = bool(allow_cross_origin_redirects)
+        self._cross_origin_redirects = cross_origin_redirects
 
     @property
     def rate_limit(self) -> RateLimitSnapshot | None:
@@ -421,11 +446,20 @@ class HTTPCollector(Collector):
         if method == request.method:
             content = self._request_body(request)
 
-        if not self._same_origin(origin, target) and not self._is_https_upgrade(origin, target):
-            if not self._allow_cross_origin_redirects:
+        cross_origin = not self._same_origin(origin, target) and not self._is_https_upgrade(
+            origin, target
+        )
+        if cross_origin:
+            policy = self._cross_origin_redirects
+            if policy == "never" or (
+                policy == "anonymous" and self._is_credentialed(client, request, auth)
+            ):
                 raise CollectorError(
                     f"refusing cross-origin redirect from {redact_url(origin)} "
-                    f"to {redact_url(target)}",
+                    f"to {redact_url(target)}: the target host would receive this "
+                    "request's credentials. Point the source at the final host, or "
+                    "pass cross_origin_redirects='always' to follow the hop with every "
+                    "credential stripped.",
                     kind=CollectorErrorKind.HTTP,
                     source_key=self.identity.key,
                     retryable=False,
@@ -438,9 +472,31 @@ class HTTPCollector(Collector):
             }
             auth = None
 
-        return (
-            client.build_request(method, target, headers=headers, content=content),
-            auth,
+        redirect = client.build_request(method, target, headers=headers, content=content)
+        if cross_origin and "cookie" in redirect.headers:
+            # build_request re-attaches the client cookie jar; the new origin must
+            # not see it.
+            del redirect.headers["cookie"]
+        return redirect, auth
+
+    @staticmethod
+    def _is_credentialed(
+        client: httpx.AsyncClient,
+        request: httpx.Request,
+        auth: object,
+    ) -> bool:
+        """True when following a cross-origin hop would hand over a secret."""
+
+        if auth is not httpx.USE_CLIENT_DEFAULT and auth is not None:
+            return True
+        if client.auth is not None:
+            return True
+        if len(client.cookies):
+            return True
+        return any(
+            name.lower() not in _CROSS_ORIGIN_SAFE_HEADERS
+            and name.lower() not in _REDIRECT_DROP_HEADERS
+            for name in request.headers
         )
 
     @staticmethod

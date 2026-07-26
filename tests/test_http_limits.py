@@ -161,13 +161,15 @@ async def test_max_response_bytes_is_configurable_and_validated() -> None:
         StubCollector(max_response_bytes=0)
     with pytest.raises(ValueError, match="max_redirects"):
         StubCollector(max_redirects=-1)
+    with pytest.raises(ValueError, match="cross_origin_redirects"):
+        StubCollector(cross_origin_redirects="maybe")
 
 
 # ---------------------------------------------------------------- C3 redirects
 
 
 @pytest.mark.asyncio
-async def test_cross_origin_redirect_does_not_replay_a_custom_auth_header() -> None:
+async def test_credentialed_cross_origin_redirect_is_refused_not_replayed() -> None:
     """httpx strips only Authorization/Cookie, so X-Api-Key used to leak."""
 
     seen: list[tuple[str, str | None]] = []
@@ -196,7 +198,84 @@ async def test_cross_origin_redirect_does_not_replay_a_custom_auth_header() -> N
 
 
 @pytest.mark.asyncio
-async def test_opted_in_cross_origin_redirect_strips_every_non_safe_header() -> None:
+async def test_anonymous_cross_origin_redirect_is_followed_with_headers_stripped() -> None:
+    """Mirrors the real http://blog.golang.org/feed.atom -> https://go.dev hop."""
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.host == "blog.example.org":
+            return httpx.Response(301, headers={"Location": "https://go.example.dev/blog/feed"})
+        return httpx.Response(200, text="<feed/>")
+
+    async with mock_client(handler) as client:
+        collector = StubCollector(client=client, retry_policy=NO_RETRIES)
+        response = await collector.request(
+            client,
+            "GET",
+            "https://blog.example.org/feed.atom",
+            headers={"If-None-Match": '"etag"'},
+        )
+
+    assert response.status_code == 200
+    assert seen == ["https://blog.example.org/feed.atom", "https://go.example.dev/blog/feed"]
+
+
+@pytest.mark.asyncio
+async def test_never_policy_refuses_even_an_anonymous_cross_origin_redirect() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "blog.example.org":
+            return httpx.Response(301, headers={"Location": "https://go.example.dev/blog/feed"})
+        return httpx.Response(200, text="<feed/>")
+
+    async with mock_client(handler) as client:
+        collector = StubCollector(
+            client=client,
+            retry_policy=NO_RETRIES,
+            cross_origin_redirects="never",
+        )
+        with pytest.raises(CollectorError, match="refusing cross-origin redirect"):
+            await collector.request(client, "GET", "https://blog.example.org/feed.atom")
+
+
+@pytest.mark.asyncio
+async def test_client_level_auth_makes_a_cross_origin_hop_credentialed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "a.example":
+            return httpx.Response(302, headers={"Location": "https://b.example/x"})
+        return httpx.Response(200, json={})
+
+    async with mock_client(handler, auth=httpx.BasicAuth("u", SECRET)) as client:
+        collector = StubCollector(client=client, retry_policy=NO_RETRIES)
+        with pytest.raises(CollectorError, match="refusing cross-origin redirect"):
+            await collector.request(client, "GET", "https://a.example/x")
+
+
+@pytest.mark.asyncio
+async def test_cookie_jar_is_not_replayed_to_a_new_origin() -> None:
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("Cookie"))
+        if request.url.host == "a.example":
+            return httpx.Response(302, headers={"Location": "https://b.example/x"})
+        return httpx.Response(200, json={})
+
+    async with mock_client(handler, cookies={"session": SECRET}) as client:
+        collector = StubCollector(
+            client=client,
+            retry_policy=NO_RETRIES,
+            cross_origin_redirects="always",
+        )
+        await collector.request(client, "GET", "https://a.example/x")
+
+    assert seen[0] is not None and SECRET in seen[0]
+    assert seen[1] is None
+
+
+@pytest.mark.asyncio
+async def test_always_policy_strips_every_non_safe_header_cross_origin() -> None:
     seen: list[httpx.Headers] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -209,7 +288,7 @@ async def test_opted_in_cross_origin_redirect_strips_every_non_safe_header() -> 
         collector = StubCollector(
             client=client,
             retry_policy=NO_RETRIES,
-            allow_cross_origin_redirects=True,
+            cross_origin_redirects="always",
         )
         response = await collector.request(
             client,
@@ -251,7 +330,7 @@ async def test_cross_origin_redirect_drops_injected_auth_credentials() -> None:
         collector = StubCollector(
             client=client,
             retry_policy=NO_RETRIES,
-            allow_cross_origin_redirects=True,
+            cross_origin_redirects="always",
         )
         await collector.request(
             client,

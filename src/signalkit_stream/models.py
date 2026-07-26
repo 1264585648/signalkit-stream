@@ -3,12 +3,70 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from urllib.parse import urlsplit
 import hashlib
 import json
 from typing import Any, Mapping
 
 
 SCHEMA_VERSION = 1
+
+#: URL schemes an event is allowed to carry. Events are fanned out to sinks that hand the
+#: URL to downstream consumers, and a consumer rendering it as an anchor turns anything
+#: script-capable (``javascript:``, ``data:``, ``vbscript:``) into stored XSS with Stream
+#: as the laundering hop. No shipped collector emits a non-HTTP URL: each one falls back to
+#: its own configured feed URL when a feed item has none, so this is a hard error rather
+#: than a silent drop.
+ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
+
+#: Generous caps for hostile or malfunctioning feeds. Real signals are orders of magnitude
+#: smaller (titles are tens of characters, articles tens of kilobytes), so these only bound
+#: the damage a feed can do to the SQLite file. Exceeding them truncates rather than raises,
+#: because dropping a real signal is worse than storing a shortened one -- JSON Feed, for
+#: example, copies whole ``attachments``/``tags`` arrays into ``metadata``.
+MAX_TITLE_LENGTH = 2_000
+MAX_AUTHOR_LENGTH = 512
+MAX_CONTENT_LENGTH = 1_000_000
+MAX_METADATA_BYTES = 262_144
+
+#: Set on ``metadata`` when any field was truncated, so a consumer can tell a shortened
+#: payload from a genuinely short one.
+TRUNCATION_MARKER = "truncated"
+
+
+def _metadata_size(metadata: Mapping[str, Any]) -> int:
+    """Serialized size of ``metadata`` in bytes, matching how the store persists it."""
+
+    return len(
+        json.dumps(dict(metadata), ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    )
+
+
+def _truncate_metadata(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Drop the largest entries until ``metadata`` serializes under the cap.
+
+    Returns ``None`` when nothing had to be dropped, so the common path pays for exactly
+    one serialization and the caller can leave the original mapping untouched. Dropping is
+    deterministic (largest serialized value first, ties broken by key name) so the same
+    input always yields the same fingerprint. Keys are dropped whole rather than shortened
+    because a half-serialized value is not something a consumer can interpret.
+    """
+
+    if _metadata_size(metadata) <= MAX_METADATA_BYTES:
+        return None
+
+    trimmed = dict(metadata)
+
+    def cost(key: Any) -> tuple[int, str]:
+        return (len(json.dumps(trimmed[key], ensure_ascii=False, default=str)), str(key))
+
+    for key in sorted(trimmed, key=cost, reverse=True):
+        if _metadata_size(trimmed) <= MAX_METADATA_BYTES:
+            break
+        if str(key) == TRUNCATION_MARKER:
+            continue
+        del trimmed[key]
+    return trimmed
 
 
 class SignalKind(StrEnum):
@@ -70,6 +128,39 @@ class SignalEvent:
         object.__setattr__(self, "collected_at", _utc(self.collected_at))
         if self.updated_at is not None:
             object.__setattr__(self, "updated_at", _utc(self.updated_at))
+        self._validate_url()
+        self._apply_size_caps()
+
+    def _validate_url(self) -> None:
+        """Reject URL schemes that are not safe to hand to a downstream consumer."""
+
+        scheme = urlsplit(self.url.strip()).scheme.lower()
+        if scheme not in ALLOWED_URL_SCHEMES:
+            allowed = ", ".join(sorted(ALLOWED_URL_SCHEMES))
+            raise ValueError(
+                f"event url scheme {scheme or '(relative)'!r} is not allowed "
+                f"(expected one of: {allowed}): {self.url.strip()[:200]!r}"
+            )
+
+    def _apply_size_caps(self) -> None:
+        """Truncate oversized text fields, recording a marker in ``metadata``."""
+
+        truncated = False
+        if self.title is not None and len(self.title) > MAX_TITLE_LENGTH:
+            object.__setattr__(self, "title", self.title[:MAX_TITLE_LENGTH])
+            truncated = True
+        if self.author is not None and len(self.author) > MAX_AUTHOR_LENGTH:
+            object.__setattr__(self, "author", self.author[:MAX_AUTHOR_LENGTH])
+            truncated = True
+        if len(self.content) > MAX_CONTENT_LENGTH:
+            object.__setattr__(self, "content", self.content[:MAX_CONTENT_LENGTH])
+            truncated = True
+
+        trimmed = _truncate_metadata(self.metadata)
+        if trimmed is not None or truncated:
+            metadata = trimmed if trimmed is not None else dict(self.metadata)
+            metadata[TRUNCATION_MARKER] = True
+            object.__setattr__(self, "metadata", metadata)
 
     @classmethod
     def stable_id(

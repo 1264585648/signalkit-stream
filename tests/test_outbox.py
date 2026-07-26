@@ -1,7 +1,9 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.storage import SQLiteSignalStore
+
+PLUS_EIGHT = timezone(timedelta(hours=8))
 
 
 def make_event(content: str = "hello", *, collected_hour: int = 10) -> SignalEvent:
@@ -71,6 +73,131 @@ def test_delivery_ready_failure_dead_and_replay(tmp_path) -> None:
         assert store.delivery_counts("brain") == {"pending": 1}
 
 
+def test_non_utc_delivery_timestamps_are_normalized_before_comparison(tmp_path) -> None:
+    """A ``+08:00`` retry time used to sort by wall clock, stalling delivery for 8 hours."""
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.register_delivery_sink("brain")
+        store.write_many([make_event()])
+        store.mark_delivery_failure(
+            "brain",
+            "sig_outbox",
+            error="temporary",
+            next_attempt_at=datetime(2026, 7, 26, 12, 0, tzinfo=PLUS_EIGHT),  # 04:00Z
+            attempted_at=datetime(2026, 7, 26, 11, 0, tzinfo=PLUS_EIGHT),  # 03:00Z
+        )
+
+        stored = store._connection.execute(
+            "SELECT next_attempt_at, updated_at FROM deliveries"
+        ).fetchone()
+        assert stored["next_attempt_at"] == "2026-07-26T04:00:00+00:00"
+        assert stored["updated_at"] == "2026-07-26T03:00:00+00:00"
+
+        assert store.list_ready_deliveries("brain", now=datetime(2026, 7, 26, 3, 59, tzinfo=UTC)) == []
+        ready = store.list_ready_deliveries("brain", now=datetime(2026, 7, 26, 4, 1, tzinfo=UTC))
+        assert len(ready) == 1
+        assert ready[0].next_attempt_at == datetime(2026, 7, 26, 4, 0, tzinfo=UTC)
+        assert ready[0].updated_at == datetime(2026, 7, 26, 3, 0, tzinfo=UTC)
+
+        # A caller-supplied non-UTC "now" is normalized on the comparison side too.
+        assert store.list_ready_deliveries(
+            "brain", now=datetime(2026, 7, 26, 11, 59, tzinfo=PLUS_EIGHT)
+        ) == []
+        assert len(
+            store.list_ready_deliveries("brain", now=datetime(2026, 7, 26, 12, 1, tzinfo=PLUS_EIGHT))
+        ) == 1
+
+        store.mark_delivery_success(
+            "brain",
+            "sig_outbox",
+            delivered_at=datetime(2026, 7, 26, 20, 0, tzinfo=PLUS_EIGHT),  # 12:00Z
+        )
+        delivered = store._connection.execute(
+            "SELECT delivered_at, updated_at FROM deliveries"
+        ).fetchone()
+        assert delivered["delivered_at"] == "2026-07-26T12:00:00+00:00"
+        assert delivered["updated_at"] == "2026-07-26T12:00:00+00:00"
+
+
+def test_ready_deliveries_are_fifo_by_instant_not_by_wall_clock(tmp_path) -> None:
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.register_delivery_sink("brain")
+        store.write_many([other_event("sig_early"), other_event("sig_late")])
+
+        # sig_early is genuinely older (15:00Z) but its raw string sorts last.
+        store.mark_delivery_failure(
+            "brain",
+            "sig_early",
+            error="boom",
+            next_attempt_at=None,
+            attempted_at=datetime(2026, 7, 26, 23, 0, tzinfo=PLUS_EIGHT),  # 15:00Z
+        )
+        store.mark_delivery_failure(
+            "brain",
+            "sig_late",
+            error="boom",
+            next_attempt_at=None,
+            attempted_at=datetime(2026, 7, 26, 16, 0, tzinfo=UTC),  # 16:00Z
+        )
+
+        order = [
+            record.event_id
+            for record in store.list_ready_deliveries(
+                "brain", now=datetime(2026, 7, 27, tzinfo=UTC)
+            )
+        ]
+        assert order == ["sig_early", "sig_late"]
+
+
+def other_event(event_id: str, content: str = "hello") -> SignalEvent:
+    return SignalEvent(
+        id=event_id,
+        source="test",
+        kind=SignalKind.POST,
+        content=content,
+        url=f"https://example.com/{event_id}",
+        created_at=datetime(2026, 7, 25, 9, 0, tzinfo=UTC),
+        collected_at=datetime(2026, 7, 25, 10, 0, tzinfo=UTC),
+    )
+
+
+def test_batched_upsert_fires_outbox_triggers_exactly_once_per_transition(tmp_path) -> None:
+    """The upsert must reproduce the insert / content-change / no-op trigger contract."""
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.register_delivery_sink("brain")
+
+        # 1. insert -> AFTER INSERT trigger creates a pending outbox row per event.
+        store.write_many([other_event("sig_a"), other_event("sig_b")])
+        assert store.delivery_counts("brain") == {"pending": 2}
+
+        store.mark_delivery_success("brain", "sig_a")
+        store.mark_delivery_success("brain", "sig_b")
+        assert store.delivery_counts("brain") == {"delivered": 2}
+
+        # 2. no-op re-write of both rows must not touch the outbox at all.
+        result = store.write_many([other_event("sig_a"), other_event("sig_b")])
+        assert (result.inserted, result.updated, result.unchanged) == (0, 0, 2)
+        assert store.delivery_counts("brain") == {"delivered": 2}
+
+        # 3. one content change inside a mixed batch resets only that event.
+        mixed = store.write_many(
+            [
+                other_event("sig_a"),  # unchanged
+                other_event("sig_b", "changed"),  # content change
+                other_event("sig_c"),  # brand new
+            ]
+        )
+        assert (mixed.inserted, mixed.updated, mixed.unchanged) == (1, 1, 1)
+        assert store.delivery_counts("brain") == {"delivered": 1, "pending": 2}
+        assert store.get_delivery("brain", "sig_a").status == "delivered"
+        reset = store.get_delivery("brain", "sig_b")
+        assert reset.status == "pending"
+        assert reset.attempts == 0
+        assert reset.delivered_at is None
+        assert store.get_delivery("brain", "sig_c").status == "pending"
+
+
 def test_register_sink_can_backfill_existing_events(tmp_path) -> None:
     with SQLiteSignalStore(tmp_path / "signals.db") as store:
         store.write_many([make_event()])
@@ -94,3 +221,61 @@ def test_register_sink_can_backfill_existing_events(tmp_path) -> None:
             ]
         )
         assert store.get_delivery("archive", "sig_after_disable") is None
+
+
+def test_reenabling_a_disabled_sink_backfills_the_gap(tmp_path) -> None:
+    """Events collected while a sink was disabled have no delivery row at all."""
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        assert store.register_delivery_sink("brain") is True
+        store.write_many([other_event("sig_before")])
+        store.mark_delivery_success("brain", "sig_before")
+
+        store.disable_delivery_sink("brain")
+        store.write_many([other_event("sig_during")])
+        assert store.get_delivery("brain", "sig_during") is None
+
+        # Re-registration is not a first-time registration, and does not ask to backfill.
+        assert store.register_delivery_sink("brain") is False
+
+        gap = store.get_delivery("brain", "sig_during")
+        assert gap is not None
+        assert gap.status == "pending"
+        assert gap.attempts == 0
+        # The already-delivered row is left exactly as it was.
+        already = store.get_delivery("brain", "sig_before")
+        assert already.status == "delivered"
+        assert already.attempts == 1
+
+
+def test_reenabling_a_sink_does_not_reset_a_failed_delivery(tmp_path) -> None:
+    retry_at = datetime(2026, 7, 25, 14, 0, tzinfo=UTC)
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.register_delivery_sink("brain")
+        store.write_many([other_event("sig_failed")])
+        store.mark_delivery_failure(
+            "brain",
+            "sig_failed",
+            error="temporary",
+            next_attempt_at=retry_at,
+            attempted_at=datetime(2026, 7, 25, 13, 0, tzinfo=UTC),
+        )
+
+        store.disable_delivery_sink("brain")
+        store.register_delivery_sink("brain")
+
+        failed = store.get_delivery("brain", "sig_failed")
+        assert failed.status == "failed"
+        assert failed.attempts == 1
+        assert failed.next_attempt_at == retry_at
+        assert failed.last_error == "temporary"
+
+
+def test_repeated_registration_of_an_enabled_sink_does_not_backfill(tmp_path) -> None:
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.write_many([other_event("sig_existing")])
+        assert store.register_delivery_sink("brain") is True
+        assert store.get_delivery("brain", "sig_existing") is None
+
+        assert store.register_delivery_sink("brain") is False
+        assert store.get_delivery("brain", "sig_existing") is None

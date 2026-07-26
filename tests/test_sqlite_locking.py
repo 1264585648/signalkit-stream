@@ -7,7 +7,9 @@ import pytest
 
 from signalkit_stream.diagnostics import DiagnosticStatus, doctor
 from signalkit_stream.maintenance import backup_database
+from signalkit_stream.migrations import migrate_database
 from signalkit_stream.models import SignalEvent, SignalKind
+from signalkit_stream.observability import read_snapshot
 from signalkit_stream.sqlite_ops import probe_write_lock
 from signalkit_stream.storage import SQLiteSignalStore
 
@@ -35,6 +37,87 @@ feed = "newstories"
 ''',
         encoding="utf-8",
     )
+
+
+def _pragma(connection: sqlite3.Connection, name: str) -> object:
+    return connection.execute(f"PRAGMA {name}").fetchone()[0]
+
+
+def test_store_enables_wal_and_relaxed_durability_pragmas(tmp_path) -> None:
+    database = tmp_path / "signals.db"
+    with SQLiteSignalStore(database) as store:
+        assert str(_pragma(store._connection, "journal_mode")).lower() == "wal"
+        assert int(_pragma(store._connection, "synchronous")) == 1  # NORMAL
+        assert int(_pragma(store._connection, "foreign_keys")) == 1
+
+    # journal_mode is persistent, so a fresh connection inherits WAL from the file.
+    plain = sqlite3.connect(database)
+    try:
+        assert str(_pragma(plain, "journal_mode")).lower() == "wal"
+    finally:
+        plain.close()
+
+
+def test_open_reader_does_not_block_a_store_write(tmp_path) -> None:
+    """With a rollback journal an open read transaction blocks every commit."""
+
+    database = tmp_path / "signals.db"
+    with SQLiteSignalStore(database) as store:
+        store.write_many([event("one")])
+
+    reader = sqlite3.connect(database, timeout=0)
+    reader.execute("BEGIN")
+    assert reader.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 1
+    try:
+        with SQLiteSignalStore(database, timeout=0) as store:
+            assert store.write_many([event("two")]).inserted == 1
+        # The reader keeps its own snapshot until it ends its transaction.
+        assert reader.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 1
+    finally:
+        reader.rollback()
+        reader.close()
+
+    assert read_snapshot(database).signals_total == 2
+
+
+def test_read_only_snapshot_works_while_a_writer_holds_the_write_lock(tmp_path) -> None:
+    database = tmp_path / "signals.db"
+    with SQLiteSignalStore(database) as store:
+        store.write_many([event("one")])
+
+        writer = sqlite3.connect(database, timeout=0)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE signals SET content = 'uncommitted' WHERE id = 'one'")
+            snapshot = read_snapshot(database)
+        finally:
+            writer.rollback()
+            writer.close()
+
+    assert snapshot.signals_total == 1
+
+
+def test_store_open_tolerates_a_refused_journal_mode_switch(tmp_path) -> None:
+    database = tmp_path / "rollback-journal.db"
+    connection = sqlite3.connect(database)
+    try:
+        migrate_database(connection)
+    finally:
+        connection.close()
+
+    locker = sqlite3.connect(database)
+    locker.execute("BEGIN IMMEDIATE")
+    try:
+        with SQLiteSignalStore(database, timeout=0) as store:
+            assert str(_pragma(store._connection, "journal_mode")).lower() == "delete"
+            assert int(_pragma(store._connection, "synchronous")) == 1
+            assert store.count() == 0
+    finally:
+        locker.rollback()
+        locker.close()
+
+    with SQLiteSignalStore(database) as store:
+        assert str(_pragma(store._connection, "journal_mode")).lower() == "wal"
 
 
 def test_store_rejects_negative_busy_timeout(tmp_path) -> None:

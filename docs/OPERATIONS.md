@@ -1,35 +1,26 @@
 # Operations guide
 
-SignalKit Stream is designed to run as a small independent ingestion process. This guide covers preflight diagnostics, database behavior, shutdown, checkpoints, delivery failures, and recovery.
+SignalKit Stream is designed to run as a small independent ingestion process. This guide covers preflight checks, process lifecycle, SQLite ownership, source progress, delivery recovery, backup/restore, and monitoring.
 
-## Preflight diagnostics
+## Preflight
 
-Before starting a new deployment or after changing configuration, run:
-
-```bash
-python -m signalkit_stream.diagnostics signalkit.toml
-```
-
-Machine-readable output:
+Validate configuration and local credential wiring without polling external sources:
 
 ```bash
-python -m signalkit_stream.diagnostics signalkit.toml --format json
+signalkit validate signalkit.toml
+signalkit doctor signalkit.toml
 ```
 
-The doctor is deliberately offline. It does not contact Reddit, GitHub, Hacker News, RSS feeds, JSON feeds, REST APIs, or webhooks. It checks:
+Machine-readable output is available for both:
 
-- the configuration file exists and parses
-- every enabled source can be constructed from the current config/environment
-- source identities are unique
-- every enabled sink can be constructed
-- sink keys are unique
-- the database parent directory is writable
-- an existing SQLite database passes `PRAGMA quick_check`
-- an existing SQLite database can acquire an immediate write transaction
+```bash
+signalkit validate signalkit.toml --format json
+signalkit doctor signalkit.toml --format json
+```
 
-Because source construction resolves configured credential environment variables, missing local credentials are reported before the runtime starts. Secrets are not printed by the doctor.
+The local diagnostic path is deliberately not a live compatibility probe. It checks configuration, enabled source/sink construction, required environment-backed credentials, database paths, SQLite integrity, and persistent schema compatibility without making normal source/webhook availability part of startup validation.
 
-A missing database is a warning, not an error: the runtime will create it on first start. A missing database parent directory is an error so deployment mistakes are not hidden by implicit directory creation during diagnostics.
+A separate opt-in GitHub Actions live-smoke workflow exists for public API compatibility checks.
 
 ## Process lifecycle
 
@@ -39,29 +30,70 @@ Start the runtime:
 signalkit run signalkit.toml
 ```
 
-The runtime handles SIGINT/SIGTERM by stopping source/delivery workers and leaving already committed SQLite transactions durable. Work that had not committed is safe to repeat because collection uses stable source IDs and idempotent persistence.
+Run one collection/delivery cycle:
 
-For deployment systems such as systemd, Docker, Kubernetes, or another supervisor, let the supervisor restart the process after an unexpected exit. SignalKit persists source checkpoints, health, events, and delivery state locally, so a restart does not reset logical progress.
+```bash
+signalkit run signalkit.toml --once
+```
 
-## Database ownership
+The long-running runtime handles SIGINT/SIGTERM and stops source/delivery workers cleanly. Already committed SQLite transactions remain durable. Work that was fetched but not committed is safe to repeat because collection uses stable source IDs and idempotent persistence.
 
-The default store is SQLite. Treat the database file as durable application state, not a cache.
+For systemd, Docker, Kubernetes, or another supervisor, let the supervisor restart the process after an unexpected exit. Stream persists checkpoints, source health, normalized events, and outbox delivery state locally, so a restart does not reset logical progress.
 
-It contains:
+## SQLite ownership
+
+Treat the configured SQLite database as durable application state, not a cache. It contains:
 
 - normalized events
 - source checkpoints
 - source health
-- enabled delivery sinks
-- pending/retry/dead/delivered outbox state
+- delivery-sink registration
+- pending / failed / dead / delivered outbox state
+- the persistent database schema version
 
-Use one writer process per SQLite database unless you have deliberately tested a different topology. SQLite supports concurrent readers, but independent writer processes compete for the same database write lock. `doctor` reports a locked database when it cannot acquire an immediate write transaction.
+Use **one Stream writer process per SQLite database** unless another topology has been deliberately load/failure tested. SQLite supports concurrent readers, but independent writers compete for the same database write lock.
 
-Back up the database before upgrading across a release that changes persistent schema. Explicit migration/version tooling remains a release-gate item until the persistent schema is declared 1.0-stable.
+The remaining 1.0 hardening includes more deterministic lock/busy tests and explicit production guidance for WAL-related deployments.
+
+## Persistent schema and upgrades
+
+Stream records its SQLite layout version in `PRAGMA user_version`.
+
+Startup behavior is fail-closed:
+
+```text
+database version < supported -> forward migration
+database version = supported -> validate and run
+database version > supported -> refuse startup
+```
+
+Migrations run atomically before the store is used. Do not manually change `user_version` to bypass an incompatibility.
+
+See `docs/MIGRATIONS.md` for migration and rollback policy.
+
+## Backup before upgrades
+
+Create a consistent backup through SQLite's backup API:
+
+```bash
+python -m signalkit_stream.maintenance backup signals.db backups/pre-upgrade.db
+```
+
+Verify it before relying on it:
+
+```bash
+python -m signalkit_stream.maintenance verify backups/pre-upgrade.db
+```
+
+The backup implementation writes a temporary sibling, verifies it with `PRAGMA quick_check`, then atomically publishes the final backup path. With `--overwrite`, an older backup is not replaced until the new copy passes verification.
+
+For the cleanest application-version boundary, stop the writer before deploying a release that may migrate persistent schema.
+
+See `docs/BACKUP.md` for the restore runbook.
 
 ## Source progress
 
-Inspect source health:
+Inspect persisted source health:
 
 ```bash
 signalkit status --db signals.db
@@ -73,7 +105,7 @@ Inspect one checkpoint:
 signalkit checkpoint hackernews:newstories --db signals.db
 ```
 
-Do not edit cursor JSON manually. A cursor is part of the adapter protocol and may carry pagination/seen-window state needed to avoid gaps.
+Do not edit cursor JSON manually. Cursors belong to adapter protocols and may contain pagination, in-progress page, and recent-ID watermark state required to avoid gaps.
 
 ## Delivery operations
 
@@ -84,48 +116,75 @@ signalkit deliveries --db signals.db
 signalkit deliveries --db signals.db --sink brain --format json
 ```
 
-A retryable sink failure remains in failed state until its scheduled retry time. A permanent failure or a delivery that exhausts the configured attempt budget becomes `dead`.
+Retryable failures remain eligible for scheduled retry. Permanent failures or exhausted retry budgets become `dead`.
 
-Replay dead letters after fixing the downstream problem:
+After fixing the downstream destination, replay dead letters:
 
 ```bash
 signalkit retry-deliveries brain --db signals.db
 ```
 
-This changes dead rows back to pending. It does not recollect the original source.
+This returns dead rows to pending state. It does not recollect the original source.
 
 ## At-least-once behavior
 
-A remote sink can accept a request immediately before the SignalKit process dies. On restart, the local outbox row may still be pending, so that event version can be sent again. This is intentional.
+A remote sink can accept a request immediately before the Stream process dies. If local acknowledgement was not committed, the same event version can be sent again after restart. This is intentional at-least-once behavior.
 
-Webhook consumers receive an idempotency key for the exact event version and should honor it when their own side effects are not naturally idempotent.
+Webhook consumers receive version-aware idempotency headers and should honor the idempotency key when their own side effects are not naturally idempotent.
 
-If the source object changes while an older version is in flight, the new source mutation remains pending even if delivery of the old payload returns success. This prevents an old acknowledgement from erasing the newer version.
+If a source object changes while an older version is in flight, success for the old payload cannot erase the newer pending outbox version.
+
+## Monitoring
+
+Read a persisted operational snapshot:
+
+```bash
+python -m signalkit_stream.observability signals.db
+```
+
+JSON and Prometheus exposition text:
+
+```bash
+python -m signalkit_stream.observability signals.db --format json
+python -m signalkit_stream.observability signals.db --format prometheus
+```
+
+Snapshots include schema status, total stored signals, source health/failure counters, per-sink backlog/status counts, attempt totals, and latest persisted errors.
+
+See `docs/OBSERVABILITY.md` for metric names and structured logging utilities.
 
 ## Recovery scenarios
 
-### Runtime crashes before a collection transaction commits
+### Crash before collection commit
 
-The event/checkpoint/outbox transaction rolls back. The source page is fetched again after restart. Stable IDs make this safe.
+The event/checkpoint/outbox transaction rolls back. The page can be fetched again after restart; stable IDs make replay safe.
 
-### Runtime crashes after collection commits
+### Crash after collection commit
 
-Events, checkpoint, and pending outbox rows are already durable. Collection resumes from the committed cursor.
+Events, checkpoint, and pending outbox rows are durable. Collection resumes from the committed cursor.
 
-### Runtime crashes during sink delivery
+### Crash during sink delivery
 
 The source checkpoint is unaffected. If local delivery acknowledgement was not committed, the outbox row is retried after restart.
 
 ### One source fails repeatedly
 
-Other source workers continue. The failing source records degraded/circuit-open health and waits according to failure backoff/cooldown.
+Other workers continue. The failing source records degraded/circuit-open health and waits according to backoff/cooldown.
 
 ### One sink fails
 
-Other sinks have independent delivery rows and continue. Fix the failed destination and replay dead letters if necessary.
+Other sinks use independent delivery rows and continue. Repair the failed destination, then replay dead letters where needed.
 
-## Deterministic release checks
+### Database is from a newer Stream release
 
-The normal CI gate does not depend on third-party network availability. It covers source parsing with mocked HTTP transports plus crash/restart and partial-failure behavior against local SQLite.
+Startup refuses to mutate it. Run the matching/newer application build or restore a compatible backup; do not force the version marker backward.
 
-Live public-API compatibility checks should remain opt-in/scheduled so Reddit/GitHub/feed outages or external rate limits cannot make ordinary code review nondeterministic.
+### Database claims the current version but required objects are missing
+
+Treat it as corruption or unsupported manual schema modification. Preserve the file for diagnosis and recover from a known-good backup instead of allowing the runtime to silently guess repairs.
+
+## Release checks
+
+Normal PR CI is deterministic and independent of third-party availability. It includes mocked HTTP source behavior, collector contracts, persistence/migration checks, fault-injection reliability tests, backup tests, and supported Python-version coverage.
+
+Live source compatibility checks remain isolated from the normal correctness gate so third-party outages, policy changes, credentials, or rate limits cannot make ordinary code review nondeterministic.

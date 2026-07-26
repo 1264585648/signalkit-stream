@@ -71,6 +71,55 @@ def test_delivery_ready_failure_dead_and_replay(tmp_path) -> None:
         assert store.delivery_counts("brain") == {"pending": 1}
 
 
+def other_event(event_id: str, content: str = "hello") -> SignalEvent:
+    return SignalEvent(
+        id=event_id,
+        source="test",
+        kind=SignalKind.POST,
+        content=content,
+        url=f"https://example.com/{event_id}",
+        created_at=datetime(2026, 7, 25, 9, 0, tzinfo=UTC),
+        collected_at=datetime(2026, 7, 25, 10, 0, tzinfo=UTC),
+    )
+
+
+def test_batched_upsert_fires_outbox_triggers_exactly_once_per_transition(tmp_path) -> None:
+    """The upsert must reproduce the insert / content-change / no-op trigger contract."""
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.register_delivery_sink("brain")
+
+        # 1. insert -> AFTER INSERT trigger creates a pending outbox row per event.
+        store.write_many([other_event("sig_a"), other_event("sig_b")])
+        assert store.delivery_counts("brain") == {"pending": 2}
+
+        store.mark_delivery_success("brain", "sig_a")
+        store.mark_delivery_success("brain", "sig_b")
+        assert store.delivery_counts("brain") == {"delivered": 2}
+
+        # 2. no-op re-write of both rows must not touch the outbox at all.
+        result = store.write_many([other_event("sig_a"), other_event("sig_b")])
+        assert (result.inserted, result.updated, result.unchanged) == (0, 0, 2)
+        assert store.delivery_counts("brain") == {"delivered": 2}
+
+        # 3. one content change inside a mixed batch resets only that event.
+        mixed = store.write_many(
+            [
+                other_event("sig_a"),  # unchanged
+                other_event("sig_b", "changed"),  # content change
+                other_event("sig_c"),  # brand new
+            ]
+        )
+        assert (mixed.inserted, mixed.updated, mixed.unchanged) == (1, 1, 1)
+        assert store.delivery_counts("brain") == {"delivered": 1, "pending": 2}
+        assert store.get_delivery("brain", "sig_a").status == "delivered"
+        reset = store.get_delivery("brain", "sig_b")
+        assert reset.status == "pending"
+        assert reset.attempts == 0
+        assert reset.delivered_at is None
+        assert store.get_delivery("brain", "sig_c").status == "pending"
+
+
 def test_register_sink_can_backfill_existing_events(tmp_path) -> None:
     with SQLiteSignalStore(tmp_path / "signals.db") as store:
         store.write_many([make_event()])

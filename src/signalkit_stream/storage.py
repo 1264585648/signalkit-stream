@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,6 +12,32 @@ import sqlite3
 from signalkit_stream.migrations import get_database_schema_version, migrate_database
 from signalkit_stream.models import SignalEvent
 from signalkit_stream.protocol import Cursor
+
+# SQLITE_MAX_VARIABLE_NUMBER defaults to 32766 on modern SQLite and 999 on builds older
+# than 3.32, so batched ``IN (...)`` reads are chunked well below the lower bound.
+_ID_CHUNK_SIZE = 500
+
+_UPSERT_SIGNAL = """
+INSERT INTO signals (
+    id, schema_version, source, source_instance, kind, title, content,
+    author, url, created_at, updated_at, collected_at, metadata_json, event_hash
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    schema_version = excluded.schema_version,
+    source = excluded.source,
+    source_instance = excluded.source_instance,
+    kind = excluded.kind,
+    title = excluded.title,
+    content = excluded.content,
+    author = excluded.author,
+    url = excluded.url,
+    created_at = excluded.created_at,
+    updated_at = excluded.updated_at,
+    collected_at = excluded.collected_at,
+    metadata_json = excluded.metadata_json,
+    event_hash = excluded.event_hash
+WHERE signals.event_hash <> excluded.event_hash
+"""
 
 
 @dataclass(slots=True, frozen=True)
@@ -147,9 +174,28 @@ class SQLiteSignalStore:
     def database_schema_version(self) -> int:
         return get_database_schema_version(self._connection)
 
+    @contextmanager
+    def _write_transaction(self) -> Iterator[None]:
+        """Run a body inside one ``BEGIN IMMEDIATE`` write transaction.
+
+        ``BEGIN IMMEDIATE`` takes the write lock before the first statement, so a
+        read-then-write sequence (dedup probe then upsert, sink probe then backfill) is
+        serialized against other writers instead of racing between the read and the
+        write. It also avoids WAL's ``SQLITE_BUSY_SNAPSHOT`` upgrade failure, which a
+        deferred read/write transaction can hit without the busy handler being consulted.
+        """
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._connection.rollback()
+            raise
+        self._connection.commit()
+
     def write_many(self, events: Iterable[SignalEvent]) -> StoreWriteResult:
         event_list = list(events)
-        with self._connection:
+        with self._write_transaction():
             return self._write_many(event_list)
 
     def save_many(self, events: Iterable[SignalEvent]) -> int:
@@ -166,7 +212,7 @@ class SQLiteSignalStore:
     ) -> StoreWriteResult:
         event_list = list(events)
         now = datetime.now(UTC)
-        with self._connection:
+        with self._write_transaction():
             result = self._write_many(event_list)
             if cursor is not None:
                 self._set_checkpoint(
@@ -179,61 +225,59 @@ class SQLiteSignalStore:
         return result
 
     def _write_many(self, events: list[SignalEvent]) -> StoreWriteResult:
+        """Apply one page of events with a chunked pre-read plus a single ``executemany``.
+
+        Must be called inside :meth:`_write_transaction`. Because the write lock is held
+        for the whole batch, the pre-read is authoritative for the duration of the write,
+        which is what makes the returned ``StoreWriteResult`` exact. The statement is an
+        upsert anyway, so even a hypothetical concurrent writer produces an update rather
+        than an ``IntegrityError`` that would roll back the entire page and its
+        checkpoint. The ``WHERE signals.event_hash <> excluded.event_hash`` guard keeps a
+        content-identical row completely untouched, so the ``AFTER UPDATE OF event_hash``
+        outbox trigger stays silent for no-op writes.
+        """
+
+        if not events:
+            return StoreWriteResult()
+
+        known = self._existing_event_hashes([event.id for event in events])
         inserted = 0
         updated = 0
         unchanged = 0
+        params: list[tuple[object, ...]] = []
         for event in events:
             fingerprint = event.fingerprint()
-            row = self._connection.execute(
-                "SELECT event_hash FROM signals WHERE id = ?",
-                (event.id,),
-            ).fetchone()
-            if row is None:
-                self._connection.execute(
-                    """
-                    INSERT INTO signals (
-                        id, schema_version, source, source_instance, kind, title, content,
-                        author, url, created_at, updated_at, collected_at, metadata_json, event_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    self._event_params(event, fingerprint),
-                )
+            existing_hash = known.get(event.id)
+            if existing_hash is None:
                 inserted += 1
-                continue
-
-            existing_hash = str(row["event_hash"] or "")
-            if existing_hash == fingerprint:
+            elif existing_hash == fingerprint:
                 unchanged += 1
                 continue
+            else:
+                updated += 1
+            known[event.id] = fingerprint
+            params.append(self._event_params(event, fingerprint))
 
-            self._connection.execute(
-                """
-                UPDATE signals SET
-                    schema_version = ?, source = ?, source_instance = ?, kind = ?, title = ?,
-                    content = ?, author = ?, url = ?, created_at = ?, updated_at = ?,
-                    collected_at = ?, metadata_json = ?, event_hash = ?
-                WHERE id = ?
-                """,
-                (
-                    event.schema_version,
-                    event.source,
-                    event.source_instance,
-                    event.kind.value,
-                    event.title,
-                    event.content,
-                    event.author,
-                    event.url,
-                    event.created_at.isoformat(),
-                    event.updated_at.isoformat() if event.updated_at else None,
-                    event.collected_at.isoformat(),
-                    json.dumps(dict(event.metadata), ensure_ascii=False, sort_keys=True),
-                    fingerprint,
-                    event.id,
-                ),
-            )
-            updated += 1
+        if params:
+            self._connection.executemany(_UPSERT_SIGNAL, params)
 
         return StoreWriteResult(inserted=inserted, updated=updated, unchanged=unchanged)
+
+    def _existing_event_hashes(self, event_ids: list[str]) -> dict[str, str]:
+        """Read stored fingerprints for many ids using chunked ``IN (...)`` lookups."""
+
+        unique_ids = list(dict.fromkeys(event_ids))
+        hashes: dict[str, str] = {}
+        for start in range(0, len(unique_ids), _ID_CHUNK_SIZE):
+            chunk = unique_ids[start : start + _ID_CHUNK_SIZE]
+            placeholders = ", ".join("?" * len(chunk))
+            rows = self._connection.execute(
+                f"SELECT id, event_hash FROM signals WHERE id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                hashes[str(row["id"])] = str(row["event_hash"] or "")
+        return hashes
 
     @staticmethod
     def _event_params(event: SignalEvent, fingerprint: str) -> tuple[object, ...]:
@@ -319,7 +363,7 @@ class SQLiteSignalStore:
 
     def record_failure(self, source_key: str, error: str) -> None:
         now = datetime.now(UTC).isoformat()
-        with self._connection:
+        with self._write_transaction():
             existing = self._connection.execute(
                 "SELECT cursor_json, last_success_at FROM checkpoints WHERE source_key = ?",
                 (source_key,),
@@ -390,7 +434,7 @@ class SQLiteSignalStore:
         if not sink_key.strip():
             raise ValueError("sink_key must not be empty")
         now = datetime.now(UTC).isoformat()
-        with self._connection:
+        with self._write_transaction():
             existing = self._connection.execute(
                 "SELECT 1 FROM delivery_sinks WHERE sink_key = ?",
                 (sink_key,),

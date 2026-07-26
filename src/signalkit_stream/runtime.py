@@ -136,6 +136,40 @@ class StreamRuntime:
         self.last_delivery_results = await self.delivery.deliver_all_once()
         return results
 
+    async def aclose(self) -> None:
+        """Release collector HTTP pools and the delivery engine.
+
+        ``run_forever`` already does this on shutdown. Callers that drive :meth:`run_once`
+        directly -- ``signalkit run --once``, cron-style one-shot invocations, embedders --
+        must call this when they are done, otherwise each collector's pooled client keeps
+        its sockets until the process exits. Safe to call more than once.
+        """
+
+        await self._close_collectors()
+        await self.delivery.close()
+
+    async def _close_collectors(self) -> None:
+        """Release every collector's pooled HTTP client.
+
+        ``HTTPCollector`` keeps one lazily created ``httpx.AsyncClient`` per instance so
+        that a poll costs a pooled request rather than a fresh TLS/CA setup. Those clients
+        hold sockets, so they must be closed once no collection is in flight. Teardown is
+        best effort: one collector failing to close must not mask the shutdown reason or
+        prevent the remaining collectors and sinks from being released.
+        """
+
+        outcomes = await asyncio.gather(
+            *(source.collector.aclose() for source in self.sources),
+            return_exceptions=True,
+        )
+        for source, outcome in zip(self.sources, outcomes):
+            if isinstance(outcome, BaseException):
+                logger.warning(
+                    "source=%s collector close failed: %s",
+                    source.collector.identity.key,
+                    outcome,
+                )
+
     async def run_forever(self, stop_event: asyncio.Event | None = None) -> None:
         """Run independent source and sink workers until stopped.
 
@@ -175,8 +209,7 @@ class StreamRuntime:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(stop_task, *tasks, return_exceptions=True)
-            # Collector teardown belongs here, next to sink teardown, once
-            # HTTPCollector.aclose() lands (pooled httpx clients).
+            await self._close_collectors()
             await self.delivery.close()
         if dead_worker_error is not None:
             raise dead_worker_error

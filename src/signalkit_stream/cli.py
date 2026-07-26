@@ -536,7 +536,10 @@ async def _run_runtime(args: argparse.Namespace) -> int:
     with SQLiteSignalStore(config.runtime.database) as store:
         runtime = StreamRuntime(config, store)
         if args.once:
-            results = await runtime.run_once()
+            try:
+                results = await runtime.run_once()
+            finally:
+                await runtime.aclose()
             for result in results:
                 print(
                     json.dumps(

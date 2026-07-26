@@ -596,3 +596,75 @@ def test_runtime_rejects_duplicate_source_identity(tmp_path) -> None:
     with SQLiteSignalStore(tmp_path / "signals.db") as store:
         with pytest.raises(ValueError, match="duplicate collector source identities"):
             StreamRuntime(config, store, registry=registry)
+
+
+class ClosingCollector(FakeCollector):
+    """Collector that records how often its pooled HTTP client was released."""
+
+    def __init__(self, instance: str, *, fail_close: bool = False) -> None:
+        super().__init__(instance)
+        self.closes = 0
+        self.collects = 0
+        self.fail_close = fail_close
+
+    async def collect(self, *, context=None, cursor=None) -> CollectorResult:
+        self.collects += 1
+        return await super().collect(context=context, cursor=cursor)
+
+    async def aclose(self) -> None:
+        self.closes += 1
+        if self.fail_close:
+            raise RuntimeError("close failed")
+
+
+def closing_registry(collector: ClosingCollector) -> CollectorRegistry:
+    registry = CollectorRegistry()
+    registry.register("fake", lambda config: collector)
+    return registry
+
+
+@pytest.mark.asyncio
+async def test_run_forever_closes_collector_http_pools_on_shutdown(tmp_path) -> None:
+    collector = ClosingCollector("one")
+    config = config_for(interval=0.05)
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(config, store, registry=closing_registry(collector))
+        stop = asyncio.Event()
+        runner = asyncio.create_task(runtime.run_forever(stop))
+        deadline = time.monotonic() + 15
+        while collector.collects == 0:
+            assert time.monotonic() < deadline, "collector never ran"
+            await asyncio.sleep(0.01)
+        stop.set()
+        await asyncio.wait_for(runner, timeout=15)
+
+    assert collector.closes == 1
+
+
+@pytest.mark.asyncio
+async def test_aclose_releases_collectors_after_a_one_shot_run(tmp_path) -> None:
+    collector = ClosingCollector("one")
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(config_for(), store, registry=closing_registry(collector))
+        await runtime.run_once()
+        assert collector.closes == 0
+
+        await runtime.aclose()
+        assert collector.closes == 1
+
+        await runtime.aclose()
+        assert collector.closes == 2, "aclose must stay safe to call more than once"
+
+
+@pytest.mark.asyncio
+async def test_collector_close_failure_is_logged_without_masking_shutdown(
+    tmp_path, caplog
+) -> None:
+    collector = ClosingCollector("one", fail_close=True)
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(config_for(), store, registry=closing_registry(collector))
+        with caplog.at_level(logging.WARNING, logger="signalkit_stream.runtime"):
+            await runtime.aclose()
+
+    assert collector.closes == 1
+    assert "collector close failed" in caplog.text

@@ -46,6 +46,14 @@ signalkit run signalkit.toml --once
 
 The long-running runtime handles SIGINT/SIGTERM and stops source/delivery workers cleanly. Already committed SQLite transactions remain durable. Work that was fetched but not committed is safe to repeat because collection uses stable source IDs and idempotent persistence.
 
+On Windows, a supervisor must send `CTRL_BREAK_EVENT` for a graceful stop:
+
+```python
+os.kill(process.pid, signal.CTRL_BREAK_EVENT)
+```
+
+Windows cannot deliver a catchable SIGTERM. `Popen.terminate()` calls `TerminateProcess`, which no handler can intercept, so it ends the process without stopping workers or closing the delivery engine. Start the child with `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP` so the console control event can reach only it, and the runtime will shut down as it does on SIGTERM elsewhere. Ctrl+C in an interactive console also works; a second Ctrl+C force-quits if shutdown does not finish.
+
 For systemd, Docker, Kubernetes, or another supervisor, let the supervisor restart the process after an unexpected exit. Stream persists checkpoints, source health, normalized events, and outbox delivery state locally, so a restart does not reset logical progress.
 
 ## SQLite ownership and contention

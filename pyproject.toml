@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signalkit-stream"
-version = "0.6.1"
+version = "0.6.2"
 description = "A reliable, pluggable public-signal ingestion layer for AI agents and lead intelligence workflows."
 readme = "README.md"
 requires-python = ">=3.11"

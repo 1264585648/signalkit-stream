@@ -1,10 +1,24 @@
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-from scripts import live_smoke
+
+def _load_live_smoke():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "live_smoke.py"
+    spec = importlib.util.spec_from_file_location("signalkit_live_smoke_test_module", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+live_smoke = _load_live_smoke()
 
 
 @pytest.mark.asyncio

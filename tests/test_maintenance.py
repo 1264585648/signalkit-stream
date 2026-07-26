@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 import json
+import os
 import sqlite3
+import sys
 
 import pytest
 
@@ -86,6 +88,79 @@ def test_failed_backup_keeps_existing_destination(tmp_path, monkeypatch) -> None
         backup_database(source, destination, overwrite=True)
 
     assert destination.read_bytes() == b"known-good-old-backup"
+    assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
+
+
+def test_backup_retries_publication_when_destination_is_transiently_locked(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "signals.db"
+    destination = tmp_path / "backup.db"
+    seed(source)
+    destination.write_bytes(b"known-good-old-backup")
+
+    real_replace = os.replace
+    attempts: list[int] = []
+
+    def flaky_replace(src, dst):  # noqa: ANN001, ANN202
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise PermissionError(13, "The process cannot access the file")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(maintenance.os, "replace", flaky_replace)
+    monkeypatch.setattr(maintenance, "_PUBLISH_RETRY_DELAY", 0.0)
+
+    result = backup_database(source, destination, overwrite=True)
+
+    assert len(attempts) == 3
+    assert result.quick_check == "ok"
+    assert verify_database(destination).ok is True
+
+
+def test_backup_gives_up_after_bounded_retries_and_preserves_prior_backup(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "signals.db"
+    destination = tmp_path / "backup.db"
+    seed(source)
+    destination.write_bytes(b"known-good-old-backup")
+
+    attempts: list[int] = []
+
+    def always_locked(src, dst):  # noqa: ANN001, ANN202
+        attempts.append(1)
+        raise PermissionError(13, "The process cannot access the file")
+
+    monkeypatch.setattr(maintenance.os, "replace", always_locked)
+    monkeypatch.setattr(maintenance, "_PUBLISH_RETRY_DELAY", 0.0)
+
+    with pytest.raises(PermissionError):
+        backup_database(source, destination, overwrite=True)
+
+    assert len(attempts) == maintenance._PUBLISH_ATTEMPTS
+    assert destination.read_bytes() == b"known-good-old-backup"
+    assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="only Windows refuses to rename over a destination that is still open",
+)
+def test_backup_over_open_destination_keeps_prior_backup_and_cleans_up(tmp_path) -> None:
+    source = tmp_path / "signals.db"
+    destination = tmp_path / "backup.db"
+    seed(source)
+    backup_database(source, destination)
+    original = destination.read_bytes()
+
+    with destination.open("rb") as reader:
+        reader.read(16)
+        with pytest.raises(OSError):
+            backup_database(source, destination, overwrite=True)
+
+    assert destination.read_bytes() == original
+    assert verify_database(destination).ok is True
     assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
 
 

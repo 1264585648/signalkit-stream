@@ -35,6 +35,21 @@ integrity check. A failed replacement therefore does not destroy the last known 
 python -m signalkit_stream.maintenance backup signals.db backup.db --overwrite
 ```
 
+### Concurrent readers can delay publication on Windows
+
+Step 7 renames the verified temporary copy over the destination. POSIX allows that while
+another process still has the destination open; Windows refuses it with
+`PermissionError: [WinError 5]` until every other handle on the destination is closed.
+Anything holding the previous backup open can therefore block publication: another reader,
+`signalkit db verify` on the backup file, a running SQLite connection, a file-sync client,
+or an antivirus scanner mid-scan.
+
+Publication retries a few times with a short delay, which absorbs a brief scan or read. If
+the destination is still held after those attempts, the backup fails with a non-zero exit
+code, the previous backup is left untouched, and the temporary copy is removed. Nothing is
+corrupted - retry the backup once the other reader has finished, or write the new backup to
+a path nothing else holds open.
+
 ## Verify a database
 
 ```bash

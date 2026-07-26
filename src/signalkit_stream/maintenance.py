@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import time
 from typing import Sequence
 
 from signalkit_stream.migrations import (
@@ -17,6 +18,29 @@ from signalkit_stream.migrations import (
     validate_database_schema,
 )
 from signalkit_stream.sqlite_ops import _sqlite_uri
+
+_PUBLISH_ATTEMPTS = 5
+_PUBLISH_RETRY_DELAY = 0.05
+
+
+def _publish_backup(temp_path: Path, destination_path: Path) -> None:
+    """Move the verified copy onto the destination, retrying transient sharing errors.
+
+    POSIX renames over an open destination; Windows refuses with ``PermissionError``
+    (``WinError 5``/``WinError 32``) while any other handle is open on it - a concurrent
+    reader, ``signalkit db verify``, or an antivirus scanner. Those holds are usually
+    short, so publication is retried a bounded number of times. The rename itself stays
+    atomic, and giving up still leaves the previous backup intact.
+    """
+
+    for attempt in range(1, _PUBLISH_ATTEMPTS + 1):
+        try:
+            os.replace(temp_path, destination_path)
+            return
+        except PermissionError:
+            if attempt == _PUBLISH_ATTEMPTS:
+                raise
+            time.sleep(_PUBLISH_RETRY_DELAY * attempt)
 
 
 @dataclass(slots=True, frozen=True)
@@ -102,7 +126,7 @@ def backup_database(
         finally:
             destination_connection.close()
 
-        os.replace(temp_path, destination_path)
+        _publish_backup(temp_path, destination_path)
         temp_path = None
     finally:
         source_connection.close()

@@ -2,6 +2,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 import logging
 import sqlite3
+import time
 
 import pytest
 
@@ -458,6 +459,129 @@ async def test_run_forever_reports_a_worker_that_dies_and_stops_its_siblings(
     assert cancelled == ["healthy"]
     assert stop.is_set() is True
     assert "died with an unhandled exception" in caplog.text
+
+
+class ArrivalSink(Sink):
+    def __init__(self, key: str, received: list[str], arrived: asyncio.Event) -> None:
+        self.key = key
+        self.received = received
+        self.arrived = arrived
+
+    async def send(self, event: SignalEvent) -> None:
+        self.received.append(event.id)
+        self.arrived.set()
+
+
+@pytest.mark.asyncio
+async def test_run_forever_assembles_source_and_delivery_workers(tmp_path) -> None:
+    stop = asyncio.Event()
+    arrived = asyncio.Event()
+    received: list[str] = []
+
+    async def compressed_sleep(delay: float) -> None:
+        # Sub-second waits are the delivery poll interval and are compressed; a source
+        # poll interval parks until the shutdown path cancels it.
+        await asyncio.sleep(0.001 if delay < 1 else 3600)
+
+    sink_registry = SinkRegistry()
+    sink_registry.register(
+        "fake-sink",
+        lambda config: ArrivalSink(config.name, received, arrived),
+    )
+    config = StreamConfig(
+        runtime=RuntimeConfig(concurrency=1, delivery_interval=0.01),
+        sources=(SourceConfig("one", "fake", interval=30, limit=1),),
+        sinks=(SinkConfig("brain", "fake-sink"),),
+    )
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(
+            config,
+            store,
+            registry=registry_for(),
+            sink_registry=sink_registry,
+            sleep=compressed_sleep,
+        )
+        runner = asyncio.create_task(runtime.run_forever(stop))
+        await asyncio.wait_for(arrived.wait(), timeout=15)
+        stop.set()
+        await asyncio.wait_for(runner, timeout=15)
+        delivery = store.get_delivery("brain", received[0])
+        health = store.get_source_health("fake:one")
+
+    assert delivery is not None
+    assert delivery.status == "delivered"
+    assert health is not None
+    assert health.total_runs >= 1
+
+
+@pytest.mark.asyncio
+async def test_stop_is_observed_while_a_source_sleeps(tmp_path) -> None:
+    stop = asyncio.Event()
+    sleeping = asyncio.Event()
+    requested: list[float] = []
+
+    async def announcing_sleep(delay: float) -> None:
+        requested.append(delay)
+        sleeping.set()
+        await asyncio.sleep(delay)
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(
+            config_for(interval=600),
+            store,
+            registry=registry_for(),
+            sleep=announcing_sleep,
+        )
+        runner = asyncio.create_task(runtime.run_forever(stop))
+        await asyncio.wait_for(sleeping.wait(), timeout=15)
+        stop.set()
+        started = time.perf_counter()
+        await asyncio.wait_for(runner, timeout=15)
+        elapsed = time.perf_counter() - started
+        health = store.get_source_health("fake:one")
+
+    assert requested == [600]
+    assert elapsed < 5
+    assert health is not None
+    assert health.total_runs == 1
+
+
+class BlockingCollector(Collector):
+    source = "blocking"
+
+    def __init__(self, instance: str, started: asyncio.Event) -> None:
+        self.instance = instance
+        self.started = started
+
+    async def collect(self, *, context=None, cursor=None) -> CollectorResult:
+        self.validate_cursor(cursor)
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_collection_cancelled_at_shutdown_does_not_advance_checkpoint(tmp_path) -> None:
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    registry = CollectorRegistry()
+    registry.register("blocking", lambda config: BlockingCollector(config.name, started))
+    config = StreamConfig(
+        runtime=RuntimeConfig(concurrency=1),
+        sources=(SourceConfig("one", "blocking", interval=60, limit=1),),
+    )
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(config, store, registry=registry)
+        runner = asyncio.create_task(runtime.run_forever(stop))
+        await asyncio.wait_for(started.wait(), timeout=15)
+        stop.set()
+        await asyncio.wait_for(runner, timeout=15)
+
+        assert store.get_checkpoint("blocking:one") is None
+        assert store.count() == 0
+        assert store.get_source_health("blocking:one") is None
 
 
 def test_runtime_rejects_duplicate_source_identity(tmp_path) -> None:

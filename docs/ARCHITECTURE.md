@@ -1,19 +1,31 @@
 # SignalKit Stream architecture
 
-SignalKit Stream owns the external-source ingestion boundary: fetching, source authentication, pagination, checkpoints, normalization, retries, persistence, scheduling, and durable delivery. It does not decide whether a signal is commercially interesting; classification, enrichment, scoring, outreach, and agent actions belong downstream.
+SignalKit Stream owns the external-source ingestion boundary: fetching, source authentication, pagination, checkpoints, normalization, retries, persistence, scheduling, and durable delivery. It does not decide whether a signal is commercially interesting; classification, enrichment, scoring, outreach, CRM synchronization, and agent actions belong downstream.
 
 ## Process boundary
 
 ```text
-source configs
-     ↓
-StreamRuntime
- ├─ source workers ──> collectors ──> SignalEvent
- │                                  ↓
- │                         SQLite transaction
- │                    event + cursor + delivery outbox
- │                                  ↓
- └─ delivery workers ─────────────> sinks
+RSS / JSON Feed / Hacker News / GitHub / Reddit / explicit REST extensions
+                              |
+                          collectors
+                              |
+                   CollectorResult + Cursor
+                              |
+                  contract validation boundary
+                              |
+                         run_collector
+                              |
+                 SQLite transaction boundary
+           event + cursor + source-visible outbox mutation
+                              |
+                         StreamRuntime
+                    source health / scheduling
+                              |
+                         DeliveryEngine
+                              |
+                   stdout / JSONL / webhook
+                              |
+                    downstream consumers
 ```
 
 Source workers and sink workers fail independently. A downstream outage therefore does not force source recollection, and one unhealthy source does not stop other sources.
@@ -22,14 +34,17 @@ Source workers and sink workers fail independently. A downstream outage therefor
 
 Every collector has a stable `SourceIdentity`, receives a `CollectorContext` plus an optional `Cursor`, and returns a `CollectorResult`.
 
-The protocol has six invariants:
+Before any persistence/checkpoint advancement, Stream validates common collector invariants:
 
-1. Every emitted item is a valid, source-agnostic `SignalEvent`.
-2. A returned cursor belongs to the collector's own source key.
-3. `primary_count` counts primary source items, not attached comments or derived events.
-4. `has_more=True` means an immediate next invocation can make progress from the returned cursor.
-5. Downstream consumers never need source-specific parsing logic.
-6. Source-specific fields stay under `metadata`.
+1. Every emitted item is a valid, source-agnostic `SignalEvent` belonging to the collector source identity.
+2. Event IDs within one result are unique.
+3. A returned cursor belongs to the collector's own source key.
+4. `primary_count` counts primary source items, not attached comments or derived events, and stays within the requested context limit.
+5. `has_more=True` has a resumable continuation boundary and the pipeline additionally requires progress.
+6. Event timestamps are timezone-aware and rate-limit values are structurally valid.
+7. Downstream consumers never need source-specific parsing logic; source-specific fields stay under `metadata`.
+
+A contract violation fails before event writes or cursor advancement.
 
 ## Event identity and mutation
 
@@ -43,14 +58,25 @@ The event fingerprint hashes source-visible content and metadata but intentional
 
 An update keeps the stable event ID and requeues delivery for enabled sinks because consumers may need the new source-visible state.
 
+Identity compatibility has two layers:
+
+```text
+event.id       stable source-object identity
+fingerprint    exact source-visible version identity
+```
+
+This distinction is why webhook idempotency keys include the fingerprint rather than only the event ID.
+
 ## Collection transaction
 
-For persisted collection, one collector page, its next cursor, and delivery-outbox rows are committed in a single SQLite transaction:
+For persisted collection, one accepted collector page, its next cursor, and source-visible delivery-outbox changes are committed in one SQLite transaction:
 
 ```text
 fetch page
     ↓
 normalize
+    ↓
+validate collector result
     ↓
 BEGIN
   insert / update events
@@ -59,7 +85,9 @@ BEGIN
 COMMIT
 ```
 
-If the process crashes before commit, the page may be fetched again. If it crashes after commit, the next run resumes from the committed cursor. Stable event IDs and idempotent upserts give collection an **at-least-once collection + idempotent persistence** model.
+If the process crashes before commit, the page may be fetched again. If it crashes after commit, the next run resumes from the committed cursor. Stable event IDs and fingerprints give collection an **at-least-once collection + idempotent persistence** model.
+
+A source checkpoint never advances merely because a fetch happened; it advances only with the accepted persistence transaction.
 
 ## Durable delivery
 
@@ -78,15 +106,17 @@ sink.send(event)
 
 Dead rows can be replayed without recollecting the source. Optional sink backfill creates missing pending rows for events already in the store.
 
-Delivery is at-least-once: a process can terminate after a remote consumer accepted a message but before the local row is marked delivered. Webhook sinks therefore emit a stable idempotency key for the **exact event version**, derived from sink key, stable event ID, and the event fingerprint. Retries of one version share a key; a later source mutation produces a different key.
+Delivery is at-least-once: a process can terminate after a remote consumer accepted a message but before the local row is marked delivered. Webhook sinks therefore emit a stable idempotency key for the **exact event version**, derived from sink key, stable event ID, and event fingerprint. Retries of one version share a key; a later source mutation produces a different key.
 
 A source mutation can also happen while an older payload is in flight. The database update trigger resets the delivery row to pending. After the sink call returns, `DeliveryEngine` compares the version it sent with the current stored fingerprint; success for an older payload is treated as superseded and never overwrites the newer pending state.
+
+Subprocess lifecycle tests exercise the same semantics through the real CLI: an abrupt process kill after a webhook side effect but before local acknowledgement leaves the delivery pending, and restart replays the same event version with the same idempotency key.
 
 Multiple configured sinks provide fan-out naturally because each `(sink_key, event_id)` row has independent attempts and failure state.
 
 ## Runtime scheduling
 
-`StreamRuntime` creates one worker per enabled source and a delivery worker per enabled sink. Global source concurrency is bounded. Each source has its own interval and persisted health state.
+`StreamRuntime` creates one worker per enabled source and delivery workers for configured sinks. Global source concurrency is bounded. Each source has its own interval and persisted health state.
 
 Successful source runs wait at least their configured interval, extended when the source reports an exhausted rate limit with a reset time. Failures use exponential delay until a configurable failure threshold opens a cooldown circuit. A source failure is recorded without terminating healthy workers.
 
@@ -106,11 +136,44 @@ SIGINT/SIGTERM causes worker cancellation after already committed SQLite transac
 
 Adapters should not duplicate retry loops or invent source-specific exception types when the shared contract can represent the failure.
 
+Source-specific authentication semantics remain in the source adapter. For example, Reddit owns OAuth access/refresh/app credentials and a single API-401 re-authentication attempt while still using shared HTTP error/retry behavior.
+
 ## Pagination safety
 
 The pipeline stops a pagination loop when a collector reports `has_more=True` but emits zero primary items, or when its cursor does not advance. A hard `max_pages` guard provides another safety boundary.
 
 A collector that cannot guarantee forward progress must return `has_more=False` and wait for a future polling cycle.
+
+## Persistence compatibility
+
+Normalized event compatibility and SQLite layout compatibility are independent:
+
+```text
+SignalEvent.schema_version  -> downstream event contract
+PRAGMA user_version         -> persistent SQLite layout
+```
+
+`DATABASE_SCHEMA_VERSION` controls persistent layout startup:
+
+```text
+older schema -> atomic forward migration
+current      -> validate required objects and run
+future       -> fail closed without mutation
+```
+
+There is no automatic downgrade path. A failed migration rolls back schema changes and the version marker together.
+
+## SQLite concurrency model
+
+The supported deployment model is **one Stream writer per SQLite database**.
+
+SQLite can serve concurrent readers, and WAL mode can improve reader/writer coexistence, but write transactions still serialize. Stream therefore exposes:
+
+- a configurable SQLite busy timeout for embedding;
+- a non-mutating `BEGIN IMMEDIATE`/rollback write-lock probe in `doctor`;
+- SQLite-aware backup through the backup API rather than raw live-file copying.
+
+Lock timeouts do not partially commit the failed application transaction. WAL backup tests prove backups observe the last committed snapshot while another writer transaction is active.
 
 ## Extension rule
 
@@ -124,6 +187,10 @@ source-native response
 SignalEvent + Cursor
 ```
 
+Use a dedicated collector when native OAuth, cursor pagination, update/delete semantics, thread traversal, specialized rate limits, or ordering guarantees matter.
+
+`GenericRESTCollector` is only for explicitly understood JSON GET/list endpoints and intentionally remains outside the default registry; arbitrary APIs do not share one safe guessed semantic contract.
+
 A new sink should mostly be delivery code:
 
 ```text
@@ -133,3 +200,30 @@ remote destination
 ```
 
 Authentication, source HTTP retry behavior, persistence, checkpointing, outbox state, delivery retry scheduling, and runtime lifecycle belong to shared infrastructure rather than individual adapters or sinks.
+
+## Operations boundary
+
+Operator/readiness surfaces read the same durable state:
+
+- `signalkit validate`
+- `signalkit doctor`
+- `signalkit status --verbose`
+- `signalkit status --format prometheus`
+- `signalkit deliveries`
+- `signalkit db backup`
+- `signalkit db verify`
+
+Live third-party compatibility probes are separate from deterministic correctness CI.
+
+## Non-goals
+
+The Stream repository does not include:
+
+- LLM intent classification
+- lead scoring/ranking
+- contact/company enrichment
+- CRM synchronization
+- outreach generation/sending
+- autonomous agent decision loops
+
+Those systems consume normalized committed events downstream and can evolve without changing source-ingestion reliability semantics.

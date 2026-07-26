@@ -30,3 +30,36 @@ jobs:
           path: test-results.xml
           if-no-files-found: ignore
       - run: python -m compileall -q src
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip build
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Smoke install wheel in a clean environment
+        run: |
+          python -m venv /tmp/signalkit-wheel
+          /tmp/signalkit-wheel/bin/python -m pip install --upgrade pip
+          /tmp/signalkit-wheel/bin/python -m pip install dist/*.whl
+          /tmp/signalkit-wheel/bin/python -c "import signalkit_stream; print(signalkit_stream.__version__)"
+          /tmp/signalkit-wheel/bin/signalkit --help >/dev/null
+          /tmp/signalkit-wheel/bin/signalkit init /tmp/signalkit-wheel.toml
+          /tmp/signalkit-wheel/bin/signalkit validate /tmp/signalkit-wheel.toml
+      - name: Smoke install sdist in a clean environment
+        run: |
+          python -m venv /tmp/signalkit-sdist
+          /tmp/signalkit-sdist/bin/python -m pip install --upgrade pip
+          /tmp/signalkit-sdist/bin/python -m pip install dist/*.tar.gz
+          /tmp/signalkit-sdist/bin/python -c "from signalkit_stream.storage import SQLiteSignalStore; print(SQLiteSignalStore.__name__)"
+          /tmp/signalkit-sdist/bin/signalkit --help >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error

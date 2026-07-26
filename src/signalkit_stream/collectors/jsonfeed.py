@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from signalkit_stream.collectors._text import html_to_text
+from signalkit_stream.collectors._text import html_to_text, redact_url
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import (
@@ -27,8 +27,8 @@ class JSONFeedCollector(HTTPCollector):
 
     ``next_url`` is remote-controlled input: it is resolved against the configured feed
     URL and only followed when it stays on the same origin (identical scheme, host, and
-    port) as that configured URL. Anything else — another host, another port, a scheme
-    other than http/https — is rejected with a ``PARSE`` error instead of being fetched
+    port) as that configured URL. Anything else (another host, another port, a scheme
+    other than http/https) is rejected with a ``PARSE`` error instead of being fetched
     or persisted into a checkpoint. ``max_page_follows`` additionally bounds how many
     ``next_url`` hops a single polling cycle may take.
     """
@@ -54,7 +54,8 @@ class JSONFeedCollector(HTTPCollector):
         super().__init__(client=client, timeout=timeout, retry_policy=retry_policy)
         self.url = url.strip()
         self.source = source
-        self.instance = instance or url
+        self.exported_url = redact_url(self.url)
+        self.instance = instance or self.exported_url
         self.seen_window = max(50, seen_window)
         self.max_page_follows = max_page_follows
 
@@ -252,7 +253,7 @@ class JSONFeedCollector(HTTPCollector):
             _optional_text(item.get("url"))
             or _optional_text(item.get("external_url"))
             or feed_home
-            or self.url
+            or self.exported_url
         )
         published = _parse_time(item.get("date_published"))
         modified = _parse_time(item.get("date_modified"))
@@ -279,7 +280,7 @@ class JSONFeedCollector(HTTPCollector):
             updated_at=modified,
             metadata={
                 "external_id": external_id,
-                "feed_url": self.url,
+                "feed_url": self.exported_url,
                 "feed_title": feed_title,
                 "external_url": item.get("external_url"),
                 "authors": authors,

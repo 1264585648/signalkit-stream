@@ -6,7 +6,7 @@ from xml.etree import ElementTree as ET
 
 import httpx
 
-from signalkit_stream.collectors._text import html_to_text
+from signalkit_stream.collectors._text import html_to_text, redact_url
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import CollectorContext, CollectorError, CollectorErrorKind, CollectorResult, Cursor
@@ -28,7 +28,8 @@ class RSSCollector(HTTPCollector):
         super().__init__(client=client, timeout=timeout, retry_policy=retry_policy)
         self.url = url
         self.source = source
-        self.instance = instance or url
+        self.exported_url = redact_url(url)
+        self.instance = instance or self.exported_url
 
     async def collect(
         self,
@@ -62,7 +63,7 @@ class RSSCollector(HTTPCollector):
             feed_title, entries = self._parse_feed(response.content)
         except (ET.ParseError, ValueError) as exc:
             raise CollectorError(
-                f"failed to parse feed {self.url}: {exc}",
+                f"failed to parse feed {self.exported_url}: {exc}",
                 kind=CollectorErrorKind.PARSE,
                 source_key=self.identity.key,
                 retryable=False,
@@ -71,7 +72,7 @@ class RSSCollector(HTTPCollector):
         selected_entries = entries[offset : offset + ctx.limit]
         events: list[SignalEvent] = []
         for entry in selected_entries:
-            link = str(entry["link"] or self.url)
+            link = str(entry["link"] or self.exported_url)
             title = html_to_text(str(entry["title"] or "")) or None
             content = html_to_text(str(entry["content"] or entry["title"] or ""))
             external_id = str(entry["id"] or link or title or len(events))
@@ -95,7 +96,7 @@ class RSSCollector(HTTPCollector):
                     created_at=created_at,
                     updated_at=updated_at,
                     metadata={
-                        "feed_url": self.url,
+                        "feed_url": self.exported_url,
                         "feed_title": feed_title,
                         "tags": entry["tags"],
                         "external_id": external_id,

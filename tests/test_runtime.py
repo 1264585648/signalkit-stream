@@ -1,9 +1,12 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+import logging
+import sqlite3
+import time
 
 import pytest
 
-from signalkit_stream.collectors.base import Collector
+from signalkit_stream.collectors.base import Collector, HTTPCollector
 from signalkit_stream.config import RuntimeConfig, SinkConfig, SourceConfig, StreamConfig
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import (
@@ -195,6 +198,390 @@ async def test_run_forever_stops_and_cancels_workers(tmp_path) -> None:
     assert sleeps == [10]
     assert health is not None
     assert health.total_runs == 1
+
+
+class RateLimitedCollector(HTTPCollector):
+    """Collector that always answers with a rate-limit error, like a bare HTTP 429."""
+
+    source = "limited"
+
+    def __init__(self, instance: str, *, snapshot: RateLimitSnapshot | None = None) -> None:
+        super().__init__()
+        self.instance = instance
+        self._rate_limit = snapshot
+
+    async def collect(self, *, context=None, cursor=None) -> CollectorResult:
+        raise CollectorError(
+            "HTTP 429 from upstream",
+            kind=CollectorErrorKind.RATE_LIMIT,
+            source_key=self.identity.key,
+            retryable=True,
+        )
+
+
+def limited_registry(snapshot: RateLimitSnapshot | None) -> CollectorRegistry:
+    registry = CollectorRegistry()
+    registry.register(
+        "limited",
+        lambda config: RateLimitedCollector(config.name, snapshot=snapshot),
+    )
+    return registry
+
+
+def limited_config(*, interval: float) -> StreamConfig:
+    return StreamConfig(
+        runtime=RuntimeConfig(
+            concurrency=1,
+            failure_threshold=5,
+            circuit_cooldown=300,
+            failure_backoff_base=5,
+        ),
+        sources=(SourceConfig("one", "limited", interval=interval, limit=1),),
+    )
+
+
+NOW = datetime(2026, 7, 25, 10, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "expected"),
+    [
+        (None, 60.0),
+        (RateLimitSnapshot(remaining=0, reset_at=NOW + timedelta(seconds=10)), 60.0),
+        (RateLimitSnapshot(retry_after=3600), 3600.0),
+    ],
+    ids=["no-hint", "hint-below-interval", "hint-above-interval"],
+)
+@pytest.mark.asyncio
+async def test_rate_limited_failure_never_polls_faster_than_the_interval(
+    tmp_path, snapshot, expected
+) -> None:
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(
+            limited_config(interval=60),
+            store,
+            registry=limited_registry(snapshot),
+            now=lambda: NOW,
+        )
+        result = (await runtime.run_once())[0]
+
+    assert result.status == "degraded"
+    assert result.delay == expected
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_hint_outlives_the_open_circuit(tmp_path) -> None:
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(
+            limited_config(interval=60),
+            store,
+            registry=limited_registry(RateLimitSnapshot(retry_after=3600)),
+            now=lambda: NOW,
+        )
+        results = [(await runtime.run_once())[0] for _ in range(6)]
+
+    assert [result.delay for result in results] == [3600.0] * 6
+    assert [result.status for result in results[:4]] == ["degraded"] * 4
+    assert results[4].status == "circuit_open"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_failure_keeps_backoff_below_the_poll_interval(tmp_path) -> None:
+    config = StreamConfig(
+        runtime=RuntimeConfig(
+            concurrency=1,
+            failure_threshold=5,
+            circuit_cooldown=300,
+            failure_backoff_base=5,
+        ),
+        sources=(SourceConfig("one", "fake", interval=3600, limit=1),),
+    )
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(config, store, registry=registry_for(fail=True))
+        delays = [(await runtime.run_once())[0].delay for _ in range(3)]
+
+    assert delays == [5, 10, 20]
+
+
+def sample_event(event_id: str) -> SignalEvent:
+    return SignalEvent(
+        id=event_id,
+        source="fake",
+        source_instance="one",
+        kind=SignalKind.POST,
+        content="reconcile",
+        url=f"https://example.com/{event_id}",
+        created_at=NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    "keep_disabled",
+    [False, True],
+    ids=["removed-from-config", "disabled-in-config"],
+)
+def test_sink_dropped_from_config_stops_queueing_pending_deliveries(
+    tmp_path, keep_disabled
+) -> None:
+    received: list[str] = []
+    sink_registry = SinkRegistry()
+    sink_registry.register("fake-sink", lambda config: FakeSink(config.name, received))
+    database = tmp_path / "signals.db"
+    source = SourceConfig("one", "fake", interval=60, limit=1)
+    with_both = StreamConfig(
+        sources=(source,),
+        sinks=(SinkConfig("brain", "fake-sink"), SinkConfig("archive", "fake-sink")),
+    )
+    remaining_sinks: tuple[SinkConfig, ...] = (SinkConfig("brain", "fake-sink"),)
+    if keep_disabled:
+        remaining_sinks += (SinkConfig("archive", "fake-sink", enabled=False),)
+    without_archive = StreamConfig(sources=(source,), sinks=remaining_sinks)
+
+    with SQLiteSignalStore(database) as store:
+        StreamRuntime(with_both, store, registry=registry_for(), sink_registry=sink_registry)
+        store.write_many([sample_event("sig_before")])
+        assert store.get_delivery("archive", "sig_before") is not None
+
+    with SQLiteSignalStore(database) as store:
+        StreamRuntime(without_archive, store, registry=registry_for(), sink_registry=sink_registry)
+        store.write_many([sample_event("sig_after")])
+        archive_after = store.get_delivery("archive", "sig_after")
+        brain_after = store.get_delivery("brain", "sig_after")
+
+    assert archive_after is None
+    assert brain_after is not None
+    assert brain_after.status == "pending"
+
+
+async def immediate_sleep(delay: float) -> None:
+    await asyncio.sleep(0)
+
+
+class CountingCollector(FakeCollector):
+    def __init__(self, instance: str, *, on_collect) -> None:
+        super().__init__(instance)
+        self._on_collect = on_collect
+
+    async def collect(self, *, context=None, cursor=None) -> CollectorResult:
+        result = await super().collect(context=context, cursor=cursor)
+        self._on_collect()
+        return result
+
+
+@pytest.mark.asyncio
+async def test_source_loop_survives_unexpected_iteration_failure(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    stop = asyncio.Event()
+    collected: list[int] = []
+
+    def on_collect() -> None:
+        collected.append(len(collected) + 1)
+        if len(collected) >= 3:
+            stop.set()
+
+    registry = CollectorRegistry()
+    registry.register(
+        "counting",
+        lambda config: CountingCollector(config.name, on_collect=on_collect),
+    )
+    config = StreamConfig(
+        runtime=RuntimeConfig(concurrency=1),
+        sources=(SourceConfig("one", "counting", interval=0.01, limit=1),),
+    )
+
+    def locked(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        monkeypatch.setattr(store, "upsert_source_health", locked)
+        runtime = StreamRuntime(config, store, registry=registry, sleep=immediate_sleep)
+        with caplog.at_level(logging.ERROR, logger="signalkit_stream.runtime"):
+            await asyncio.wait_for(runtime.run_forever(stop), timeout=10)
+
+    assert len(collected) >= 3
+    assert "iteration failed unexpectedly" in caplog.text
+    assert "database is locked" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_forever_reports_a_worker_that_ends_on_its_own(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    stop = asyncio.Event()
+
+    async def ends_immediately(source, stop_event) -> None:
+        return None
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(config_for(), store, registry=registry_for())
+        monkeypatch.setattr(runtime, "_source_loop", ends_immediately)
+        with caplog.at_level(logging.ERROR, logger="signalkit_stream.runtime"):
+            with pytest.raises(RuntimeError, match="ended unexpectedly"):
+                await asyncio.wait_for(runtime.run_forever(stop), timeout=10)
+
+    assert "ended on its own" in caplog.text
+    assert stop.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_run_forever_reports_a_worker_that_dies_and_stops_its_siblings(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    stop = asyncio.Event()
+    cancelled: list[str] = []
+
+    async def loop_for(source, stop_event) -> None:
+        if source.config.name == "boom":
+            raise ZeroDivisionError("worker exploded")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(source.config.name)
+            raise
+
+    registry = CollectorRegistry()
+    registry.register("fake", lambda config: FakeCollector(config.name))
+    config = StreamConfig(
+        runtime=RuntimeConfig(concurrency=2),
+        sources=(
+            SourceConfig("healthy", "fake", interval=60, limit=1),
+            SourceConfig("boom", "fake", interval=60, limit=1),
+        ),
+    )
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(config, store, registry=registry)
+        monkeypatch.setattr(runtime, "_source_loop", loop_for)
+        with caplog.at_level(logging.ERROR, logger="signalkit_stream.runtime"):
+            with pytest.raises(ZeroDivisionError, match="worker exploded"):
+                await asyncio.wait_for(runtime.run_forever(stop), timeout=10)
+
+    assert cancelled == ["healthy"]
+    assert stop.is_set() is True
+    assert "died with an unhandled exception" in caplog.text
+
+
+class ArrivalSink(Sink):
+    def __init__(self, key: str, received: list[str], arrived: asyncio.Event) -> None:
+        self.key = key
+        self.received = received
+        self.arrived = arrived
+
+    async def send(self, event: SignalEvent) -> None:
+        self.received.append(event.id)
+        self.arrived.set()
+
+
+@pytest.mark.asyncio
+async def test_run_forever_assembles_source_and_delivery_workers(tmp_path) -> None:
+    stop = asyncio.Event()
+    arrived = asyncio.Event()
+    received: list[str] = []
+
+    async def compressed_sleep(delay: float) -> None:
+        # Sub-second waits are the delivery poll interval and are compressed; a source
+        # poll interval parks until the shutdown path cancels it.
+        await asyncio.sleep(0.001 if delay < 1 else 3600)
+
+    sink_registry = SinkRegistry()
+    sink_registry.register(
+        "fake-sink",
+        lambda config: ArrivalSink(config.name, received, arrived),
+    )
+    config = StreamConfig(
+        runtime=RuntimeConfig(concurrency=1, delivery_interval=0.01),
+        sources=(SourceConfig("one", "fake", interval=30, limit=1),),
+        sinks=(SinkConfig("brain", "fake-sink"),),
+    )
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(
+            config,
+            store,
+            registry=registry_for(),
+            sink_registry=sink_registry,
+            sleep=compressed_sleep,
+        )
+        runner = asyncio.create_task(runtime.run_forever(stop))
+        await asyncio.wait_for(arrived.wait(), timeout=15)
+        stop.set()
+        await asyncio.wait_for(runner, timeout=15)
+        delivery = store.get_delivery("brain", received[0])
+        health = store.get_source_health("fake:one")
+
+    assert delivery is not None
+    assert delivery.status == "delivered"
+    assert health is not None
+    assert health.total_runs >= 1
+
+
+@pytest.mark.asyncio
+async def test_stop_is_observed_while_a_source_sleeps(tmp_path) -> None:
+    stop = asyncio.Event()
+    sleeping = asyncio.Event()
+    requested: list[float] = []
+
+    async def announcing_sleep(delay: float) -> None:
+        requested.append(delay)
+        sleeping.set()
+        await asyncio.sleep(delay)
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(
+            config_for(interval=600),
+            store,
+            registry=registry_for(),
+            sleep=announcing_sleep,
+        )
+        runner = asyncio.create_task(runtime.run_forever(stop))
+        await asyncio.wait_for(sleeping.wait(), timeout=15)
+        stop.set()
+        started = time.perf_counter()
+        await asyncio.wait_for(runner, timeout=15)
+        elapsed = time.perf_counter() - started
+        health = store.get_source_health("fake:one")
+
+    assert requested == [600]
+    assert elapsed < 5
+    assert health is not None
+    assert health.total_runs == 1
+
+
+class BlockingCollector(Collector):
+    source = "blocking"
+
+    def __init__(self, instance: str, started: asyncio.Event) -> None:
+        self.instance = instance
+        self.started = started
+
+    async def collect(self, *, context=None, cursor=None) -> CollectorResult:
+        self.validate_cursor(cursor)
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_collection_cancelled_at_shutdown_does_not_advance_checkpoint(tmp_path) -> None:
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    registry = CollectorRegistry()
+    registry.register("blocking", lambda config: BlockingCollector(config.name, started))
+    config = StreamConfig(
+        runtime=RuntimeConfig(concurrency=1),
+        sources=(SourceConfig("one", "blocking", interval=60, limit=1),),
+    )
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(config, store, registry=registry)
+        runner = asyncio.create_task(runtime.run_forever(stop))
+        await asyncio.wait_for(started.wait(), timeout=15)
+        stop.set()
+        await asyncio.wait_for(runner, timeout=15)
+
+        assert store.get_checkpoint("blocking:one") is None
+        assert store.count() == 0
+        assert store.get_source_health("blocking:one") is None
 
 
 def test_runtime_rejects_duplicate_source_identity(tmp_path) -> None:

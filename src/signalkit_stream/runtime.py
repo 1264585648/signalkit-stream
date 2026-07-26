@@ -73,6 +73,7 @@ class StreamRuntime:
         self.sinks = tuple(self.sink_registry.create(sink) for sink in enabled_sink_configs)
         for sink_config, sink in zip(enabled_sink_configs, self.sinks, strict=True):
             self.store.register_delivery_sink(sink.key, backfill=sink_config.backfill)
+        self._reconcile_delivery_sinks(frozenset(sink.key for sink in self.sinks))
         self.delivery = DeliveryEngine(
             self.store,
             self.sinks,
@@ -86,6 +87,37 @@ class StreamRuntime:
         )
         self.last_delivery_results: list[DeliveryResult] = []
         self._restore_health()
+
+    def _reconcile_delivery_sinks(self, active_keys: frozenset[str]) -> None:
+        """Disable database sinks that this configuration no longer drains.
+
+        ``register_delivery_sink`` only ever enables rows, so a sink that an operator
+        removes from the config (or flips to ``enabled = false``) keeps its row at
+        ``enabled = 1``. The insert/update triggers then keep queueing ``pending``
+        delivery rows that no worker will ever drain, growing ``deliveries`` without
+        bound. Reconciling at startup makes the database follow the config in both
+        directions. Rows queued *before* the sink was removed are intentionally left
+        alone: draining or pruning historical backlog is an operator decision
+        (``signalkit retry-deliveries`` / maintenance), not a startup side effect.
+        """
+
+        for key in self._enabled_delivery_sink_keys():
+            if key in active_keys:
+                continue
+            logger.warning(
+                "sink=%s disabled: not present as an enabled sink in the current configuration",
+                key,
+            )
+            self.store.disable_delivery_sink(key)
+
+    def _enabled_delivery_sink_keys(self) -> tuple[str, ...]:
+        connection = getattr(self.store, "_connection", None)
+        if connection is None:  # pragma: no cover - non-SQLite stores cannot be reconciled
+            return ()
+        rows = connection.execute(
+            "SELECT sink_key FROM delivery_sinks WHERE enabled = 1 ORDER BY sink_key"
+        ).fetchall()
+        return tuple(str(row[0]) for row in rows)
 
     def _restore_health(self) -> None:
         for source in self.sources:
@@ -105,7 +137,16 @@ class StreamRuntime:
         return results
 
     async def run_forever(self, stop_event: asyncio.Event | None = None) -> None:
-        """Run independent source and sink workers until stopped."""
+        """Run independent source and sink workers until stopped.
+
+        The supervisor waits on the workers *and* the stop event. A worker that ends on
+        its own is a defect rather than normal operation -- every source iteration is
+        individually guarded (see ``_source_loop``) -- so its exit is logged and the
+        whole runtime shuts down and re-raises instead of leaving a process that looks
+        healthy while collecting nothing. Restart is deliberately delegated to the
+        process supervisor (systemd/docker/k8s), which owns restart backoff and crash
+        looping policy; an in-process restart loop would hide the defect and could spin.
+        """
 
         stop = stop_event or asyncio.Event()
         tasks = [
@@ -116,20 +157,88 @@ class StreamRuntime:
             tasks.append(asyncio.create_task(self.delivery.run_forever(stop), name="signalkit:delivery"))
         if not tasks:
             return
+        stop_task = asyncio.create_task(stop.wait(), name="signalkit:stop")
+        dead_worker_error: BaseException | None = None
         try:
-            await stop.wait()
+            done, _pending = await asyncio.wait(
+                {*tasks, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            dead_worker_error = self._dead_worker_error(
+                done,
+                stop_task=stop_task,
+                stopping=stop.is_set(),
+            )
         finally:
+            stop.set()
+            stop_task.cancel()
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(stop_task, *tasks, return_exceptions=True)
+            # Collector teardown belongs here, next to sink teardown, once
+            # HTTPCollector.aclose() lands (pooled httpx clients).
             await self.delivery.close()
+        if dead_worker_error is not None:
+            raise dead_worker_error
+
+    def _dead_worker_error(
+        self,
+        done: set[asyncio.Task[None]],
+        *,
+        stop_task: asyncio.Task[bool],
+        stopping: bool,
+    ) -> BaseException | None:
+        """Log every worker that finished before the stop event and return the first error."""
+
+        first: BaseException | None = None
+        for task in done:
+            if task is stop_task or task.cancelled():
+                continue
+            error = task.exception()
+            if error is not None:
+                logger.error(
+                    "worker=%s died with an unhandled exception; shutting down runtime",
+                    task.get_name(),
+                    exc_info=error,
+                )
+            elif stopping:
+                continue
+            else:
+                logger.error(
+                    "worker=%s ended on its own without an error; shutting down runtime",
+                    task.get_name(),
+                )
+                error = RuntimeError(f"runtime worker {task.get_name()} ended unexpectedly")
+            if first is None:
+                first = error
+        return first
 
     async def _source_loop(self, source: RuntimeSource, stop: asyncio.Event) -> None:
+        """Poll one source until stopped, surviving unexpected per-iteration failures.
+
+        Everything in an iteration can fail, not just the collector call: health
+        persistence is a database write and can raise ``database is locked``. Without
+        this guard such a failure would end the worker permanently while the process
+        kept looking healthy. An unexpected failure is logged and retried after the
+        configured poll interval -- never faster, so a repeatedly broken iteration
+        cannot hammer the remote source.
+        """
+
         while not stop.is_set():
-            result = await self._run_source(source)
+            try:
+                delay = (await self._run_source(source)).delay
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "source=%s iteration failed unexpectedly; retrying in %.1fs",
+                    source.collector.identity.key,
+                    source.config.interval,
+                )
+                delay = source.config.interval
             if stop.is_set():
                 break
-            await self._sleep_or_stop(result.delay, stop)
+            await self._sleep_or_stop(delay, stop)
 
     async def _sleep_or_stop(self, delay: float, stop: asyncio.Event) -> None:
         if delay <= 0:
@@ -230,13 +339,40 @@ class StreamRuntime:
         return max(interval, self._rate_limit_delay(rate_limit))
 
     def _failure_delay(self, source: RuntimeSource, error: CollectorError) -> float:
-        if source.failures >= self.config.runtime.failure_threshold:
-            return self.config.runtime.circuit_cooldown
-        rate_limit = source.collector.rate_limit if isinstance(source.collector, HTTPCollector) else None
+        """Return how long to wait after a failed run.
+
+        Policy, in priority order:
+
+        1. A ``RATE_LIMIT`` error is an explicit slow-down signal and always wins. Its
+           delay is ``max(Retry-After/reset hint, source interval)``: the hint is
+           honoured in full even when it exceeds the poll interval or the circuit
+           cooldown, and a 429 that carries no hint still costs at least one full poll
+           interval. Answering "slow down" with traffic *faster* than the configured
+           interval is never correct.
+        2. An open circuit waits at least ``circuit_cooldown``, but never less than an
+           outstanding rate-limit hint -- cooldown is a floor for failing sources, not a
+           licence to ignore an endpoint that asked for an hour.
+        3. Ordinary (non rate-limited) failures keep exponential backoff clamped *down*
+           to the poll interval: ``min(interval, failure_backoff_base * 2**(n-1))``.
+           This is deliberately faster than the interval for long-interval sources: a
+           failed poll returned no data, the request budget it would have spent is
+           unused, and a source polled hourly should recover from a transient blip in
+           seconds rather than an hour. Sustained failure traffic is already bounded by
+           the circuit breaker in rule 2.
+        """
+
+        limited = 0.0
         if error.kind is CollectorErrorKind.RATE_LIMIT:
-            limited_delay = self._rate_limit_delay(rate_limit)
-            if limited_delay > 0:
-                return limited_delay
+            rate_limit = (
+                source.collector.rate_limit
+                if isinstance(source.collector, HTTPCollector)
+                else None
+            )
+            limited = max(self._rate_limit_delay(rate_limit), source.config.interval)
+        if source.failures >= self.config.runtime.failure_threshold:
+            return max(self.config.runtime.circuit_cooldown, limited)
+        if limited > 0:
+            return limited
         exponent = max(0, source.failures - 1)
         return min(
             source.config.interval,

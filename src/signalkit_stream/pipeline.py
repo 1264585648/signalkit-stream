@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from typing import Any, Mapping
 
 from signalkit_stream.collectors.base import Collector
@@ -8,6 +9,8 @@ from signalkit_stream.contracts import validate_collector_result
 from signalkit_stream.models import SignalEvent
 from signalkit_stream.protocol import CollectorContext, CollectorError, Cursor, RateLimitSnapshot
 from signalkit_stream.storage import SignalStore, StoreWriteResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -26,6 +29,24 @@ class CollectionResult:
     @property
     def changed(self) -> int:
         return self.inserted + self.updated
+
+
+def _record_failure(store: SignalStore | None, source_key: str, error: str) -> None:
+    """Best-effort failure bookkeeping that can never mask the original exception.
+
+    ``record_failure`` opens its own write transaction, so it is most likely to raise
+    exactly when the collection failure was itself database related (locked database,
+    disk full). Letting that secondary error escape would replace the real
+    ``CollectorError`` on its way out of ``run_collector`` and lose the failure record
+    *and* the diagnosis.
+    """
+
+    if store is None:
+        return
+    try:
+        store.record_failure(source_key, error)
+    except Exception:
+        logger.exception("failed to record collection failure for source=%s", source_key)
 
 
 async def run_collector(
@@ -103,12 +124,10 @@ async def run_collector(
         if pages >= max_pages and has_more:
             warnings.append(f"stopped after max_pages={max_pages}")
     except CollectorError as exc:
-        if store is not None:
-            store.record_failure(source_key, str(exc))
+        _record_failure(store, source_key, str(exc))
         raise
     except Exception as exc:
-        if store is not None:
-            store.record_failure(source_key, repr(exc))
+        _record_failure(store, source_key, repr(exc))
         raise
 
     return CollectionResult(

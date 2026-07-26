@@ -120,7 +120,9 @@ Multiple configured sinks provide fan-out naturally because each `(sink_key, eve
 
 Successful source runs wait at least their configured interval, extended when the source reports an exhausted rate limit with a reset time. Failures use exponential delay until a configurable failure threshold opens a cooldown circuit. A source failure is recorded without terminating healthy workers.
 
-SIGINT/SIGTERM causes worker cancellation after already committed SQLite transactions remain durable. Uncommitted work is intentionally safe to replay on restart.
+SIGINT/SIGTERM causes worker cancellation after already committed SQLite transactions remain durable. Uncommitted work is intentionally safe to replay on restart. On Windows the catchable equivalent is `CTRL_BREAK_EVENT`, delivered as `SIGBREAK`; `TerminateProcess` (what `Popen.terminate()` calls) cannot be intercepted by any handler, so a supervisor there must send `CTRL_BREAK_EVENT` to stop the runtime cleanly. See `docs/OPERATIONS.md`.
+
+A worker that ends on its own is treated as a defect rather than normal operation: every source iteration is individually guarded, so the supervisor logs the exit, stops the remaining workers, and re-raises instead of leaving a process that looks healthy while collecting nothing. Restart policy belongs to the process supervisor.
 
 ## HTTP policy
 
@@ -133,14 +135,31 @@ SIGINT/SIGTERM causes worker cancellation after already committed SQLite transac
 - retry policy for 408, 425, 429, and transient 5xx responses
 - rate-limit header inspection
 - stable `CollectorError` classification
+- one pooled `httpx.AsyncClient` per collector instance, released by `aclose()`
+- a response byte cap (`max_response_bytes`) enforced while streaming
+- redirect policy, including the cross-origin credential rule below
 
 Adapters should not duplicate retry loops or invent source-specific exception types when the shared contract can represent the failure.
+
+Client construction is expensive and synchronous — it builds a fresh TLS context and CA bundle — so a client is created lazily once per collector and reused for the instance lifetime. `StreamRuntime` closes them after its workers are joined; embedders driving `run_once` directly should call `StreamRuntime.aclose()`.
+
+Redirects are resolved explicitly rather than delegated to the HTTP client, because a client only strips `Authorization` and `Cookie` on a cross-origin hop while an operator-configured auth header keeps travelling. `cross_origin_redirects` selects the policy:
+
+```text
+never      refuse every cross-origin hop
+anonymous  follow only a request that carries nothing to leak (default)
+always     follow, keeping only safe headers
+```
+
+Same-origin hops and same-host `http`→`https` upgrades always follow with headers intact. A credentialed cross-origin hop is refused with an actionable error rather than silently stripped, so a redirect can never launder a secret to another host.
 
 Source-specific authentication semantics remain in the source adapter. For example, Reddit owns OAuth access/refresh/app credentials and a single API-401 re-authentication attempt while still using shared HTTP error/retry behavior.
 
 ## Pagination safety
 
 The pipeline stops a pagination loop when a collector reports `has_more=True` but emits zero primary items, or when its cursor does not advance. A hard `max_pages` guard provides another safety boundary.
+
+A continuation URL supplied by the remote source is untrusted input. JSON Feed's `next_url` is resolved against the configured feed URL and must land on the same origin, both when it arrives and when it is restored from a checkpoint, so a feed operator cannot point collection at an unrelated host or persist such a target. `max_page_follows` caps remote-directed hops per cycle independently of `max_pages`.
 
 A collector that cannot guarantee forward progress must return `has_more=False` and wait for a future polling cycle.
 

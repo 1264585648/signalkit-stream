@@ -61,7 +61,7 @@ Reddit supports static access tokens, refresh-token rollover, and confidential-c
 
 - strict TOML configuration and source/sink registries
 - independent long-running source workers with bounded global concurrency
-- graceful SIGINT/SIGTERM shutdown
+- graceful SIGINT/SIGTERM shutdown (on Windows, `CTRL_BREAK_EVENT` delivered as `SIGBREAK`)
 - source failure backoff and circuit-open cooldown
 - rate-limit-aware scheduling
 - persisted source health across restarts

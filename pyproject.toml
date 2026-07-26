@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signalkit-stream"
-version = "0.7.0"
+version = "1.0.0rc1"
 description = "A reliable, pluggable public-signal ingestion layer for AI agents and lead intelligence workflows."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,7 +25,7 @@ keywords = [
   "social-listening",
 ]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",

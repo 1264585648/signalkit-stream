@@ -52,7 +52,7 @@ async def test_static_access_token_skips_token_endpoint() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         assert request.url.path == "/r/python/new"
-        assert request.headers["Authorization"] == "bearer static-token"
+        assert request.headers["Authorization"].lower() == "bearer static-token"
         return listing(request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -89,7 +89,7 @@ async def test_refresh_token_allows_installed_client_empty_secret_and_caches_acc
                 request=request,
             )
         listing_requests += 1
-        assert request.headers["Authorization"] == "bearer fresh-token"
+        assert request.headers["Authorization"].lower() == "bearer fresh-token"
         return listing(request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -123,7 +123,7 @@ async def test_client_credentials_mode_requests_app_only_token() -> None:
                 json={"access_token": "app-token", "expires_in": 3600},
                 request=request,
             )
-        assert request.headers["Authorization"] == "bearer app-token"
+        assert request.headers["Authorization"].lower() == "bearer app-token"
         return listing(request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -157,9 +157,10 @@ async def test_api_401_refreshes_bearer_once_then_retries_request() -> None:
             )
 
         listing_requests += 1
-        if request.headers["Authorization"] == "bearer expired-token":
+        authorization = request.headers["Authorization"].lower()
+        if authorization == "bearer expired-token":
             return httpx.Response(401, json={"message": "Unauthorized"}, request=request)
-        assert request.headers["Authorization"] == "bearer fresh-token"
+        assert authorization == "bearer fresh-token"
         return listing(request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:

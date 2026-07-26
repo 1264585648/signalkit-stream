@@ -43,6 +43,7 @@ def test_doctor_warns_before_automatic_forward_migration(tmp_path) -> None:
         pass
     connection = sqlite3.connect(database)
     connection.execute("PRAGMA user_version = 0")
+    connection.commit()
     connection.close()
 
     check = _schema_check(doctor(_config(tmp_path, database)))
@@ -56,6 +57,7 @@ def test_doctor_fails_for_future_schema(tmp_path) -> None:
     connection = sqlite3.connect(database)
     connection.execute("CREATE TABLE marker (value TEXT)")
     connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION + 1}")
+    connection.commit()
     connection.close()
 
     check = _schema_check(doctor(_config(tmp_path, database)))
@@ -69,6 +71,7 @@ def test_doctor_fails_when_current_version_claim_is_incomplete(tmp_path) -> None
     connection = sqlite3.connect(database)
     connection.execute("CREATE TABLE marker (value TEXT)")
     connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
+    connection.commit()
     connection.close()
 
     check = _schema_check(doctor(_config(tmp_path, database)))

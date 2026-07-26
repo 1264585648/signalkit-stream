@@ -10,7 +10,7 @@ import pytest
 
 import signalkit_stream
 from signalkit_stream.collectors import _base_impl
-from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
+from signalkit_stream.collectors.base import Collector, HTTPCollector, RetryPolicy
 from signalkit_stream.protocol import CollectorError, CollectorErrorKind, CollectorResult
 
 SECRET = "s3cr3t-api-key"
@@ -504,3 +504,27 @@ async def test_owned_client_sends_the_versioned_user_agent_by_default() -> None:
 def test_explicit_user_agent_still_wins() -> None:
     collector = StubCollector(user_agent="custom/1.0")
     assert collector._user_agent == "custom/1.0"
+
+
+# --------------------------------------------------------------- C6 shim gone
+
+
+def test_collectors_base_is_a_plain_reexport_of_the_implementation() -> None:
+    assert HTTPCollector is _base_impl.HTTPCollector
+    assert Collector is _base_impl.Collector
+    assert RetryPolicy is _base_impl.RetryPolicy
+    # No shim subclass between the public name and the implementation.
+    assert HTTPCollector.__mro__[:2] == (_base_impl.HTTPCollector, _base_impl.Collector)
+
+
+@pytest.mark.asyncio
+async def test_allow_statuses_shim_keyword_is_gone() -> None:
+    async with mock_client(lambda request: httpx.Response(200, json={})) as client:
+        collector = StubCollector(client=client, retry_policy=NO_RETRIES)
+        with pytest.raises(TypeError):
+            await collector.request(
+                client,
+                "GET",
+                "https://example.com/x",
+                allow_statuses={304},
+            )

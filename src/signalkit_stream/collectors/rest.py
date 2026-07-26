@@ -158,7 +158,6 @@ class GenericRESTCollector(HTTPCollector):
                 context=ctx,
                 params=request_params or None,
                 headers=request_headers or None,
-                allow_statuses={304},
             )
 
         if response.status_code == 304:

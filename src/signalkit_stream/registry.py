@@ -129,6 +129,8 @@ def _reddit_factory(config: SourceConfig) -> Collector:
             "comments",
             "seen_window",
             "instance",
+            "access_token_env",
+            "refresh_token_env",
             "client_id_env",
             "client_secret_env",
             "user_agent_env",
@@ -140,23 +142,56 @@ def _reddit_factory(config: SourceConfig) -> Collector:
     time_filter = _optional_string(options.get("time_filter"))
     comments = _nonnegative_int(options.get("comments", 0), "comments", config)
     seen_window = _positive_int(options.get("seen_window", 500), "seen_window", config)
-    client_id = _required_environment(
+
+    access_token = _optional_environment(
+        options.get("access_token_env", "REDDIT_ACCESS_TOKEN"),
+        "access_token_env",
+        config,
+    )
+    refresh_token = _optional_environment(
+        options.get("refresh_token_env", "REDDIT_REFRESH_TOKEN"),
+        "refresh_token_env",
+        config,
+    )
+    client_id = _optional_environment(
         options.get("client_id_env", "REDDIT_CLIENT_ID"),
         "client_id_env",
         config,
     )
-    client_secret = _required_environment(
+    client_secret = _optional_environment(
         options.get("client_secret_env", "REDDIT_CLIENT_SECRET"),
         "client_secret_env",
         config,
     )
+
+    if refresh_token and not client_id:
+        env_name = str(options.get("client_id_env", "REDDIT_CLIENT_ID")).strip()
+        raise ValueError(
+            f"source {config.name!r}: environment variable {env_name!r} required "
+            "when a Reddit refresh token is configured"
+        )
+    if not access_token and not refresh_token:
+        client_id = client_id or _required_environment(
+            options.get("client_id_env", "REDDIT_CLIENT_ID"),
+            "client_id_env",
+            config,
+        )
+        client_secret = client_secret or _required_environment(
+            options.get("client_secret_env", "REDDIT_CLIENT_SECRET"),
+            "client_secret_env",
+            config,
+        )
+
     user_agent = _required_environment(
         options.get("user_agent_env", "REDDIT_USER_AGENT"),
         "user_agent_env",
         config,
     )
+
     return RedditCollector(
         subreddit,
+        access_token=access_token,
+        refresh_token=refresh_token,
         client_id=client_id,
         client_secret=client_secret,
         user_agent=user_agent,
@@ -194,6 +229,14 @@ def _required_environment(value: Any, key: str, config: SourceConfig) -> str:
             f"source {config.name!r}: environment variable {env_name!r} required by {key} is not set"
         )
     return resolved
+
+
+def _optional_environment(value: Any, key: str, config: SourceConfig) -> str | None:
+    env_name = str(value).strip()
+    if not env_name:
+        raise ValueError(f"source {config.name!r}: {key} must not be empty")
+    resolved = os.getenv(env_name)
+    return resolved if resolved else None
 
 
 def _optional_string(value: Any) -> str | None:

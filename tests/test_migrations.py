@@ -1,8 +1,11 @@
 from datetime import UTC, datetime
+import importlib
+import inspect
 import sqlite3
 
 import pytest
 
+from signalkit_stream import storage as storage_module
 from signalkit_stream.migrations import (
     DATABASE_SCHEMA_VERSION,
     DatabaseMigrationError,
@@ -11,6 +14,18 @@ from signalkit_stream.migrations import (
     migrate_database,
 )
 from signalkit_stream.storage import SQLiteSignalStore
+
+
+def test_migrations_module_is_the_only_persistent_schema_definition() -> None:
+    """Guard against re-introducing a duplicate (and therefore drifting) DDL copy."""
+
+    source = inspect.getsource(storage_module)
+    assert "CREATE TABLE" not in source
+    assert "CREATE INDEX" not in source
+    assert "CREATE TRIGGER" not in source
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("signalkit_stream._storage_impl")
 
 
 def test_new_database_is_initialized_at_current_schema_version(tmp_path) -> None:

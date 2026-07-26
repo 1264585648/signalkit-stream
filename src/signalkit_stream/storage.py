@@ -17,6 +17,30 @@ from signalkit_stream.protocol import Cursor
 # than 3.32, so batched ``IN (...)`` reads are chunked well below the lower bound.
 _ID_CHUNK_SIZE = 500
 
+
+def _utc_iso(value: datetime) -> str:
+    """Serialize a datetime as a lexicographically sortable UTC ISO-8601 string.
+
+    Every timestamp this module stores is compared and ordered by SQLite as text
+    (``next_attempt_at <= ?`` for delivery readiness, ``ORDER BY updated_at`` for outbox
+    FIFO), so a value carrying any offset other than ``+00:00`` sorts by its wall clock
+    rather than by its instant. Naive values are treated as UTC, mirroring
+    :func:`signalkit_stream.models._utc`, which already normalizes every ``SignalEvent``
+    timestamp before it reaches the ``signals`` table.
+
+    No migration ships for pre-existing rows: no shipped code path can persist a
+    non-UTC delivery timestamp (``DeliveryEngine`` derives all of them from
+    ``datetime.now(UTC)``, and the outbox triggers copy ``NEW.collected_at``, already
+    normalized by ``SignalEvent``), such a row could only come from a custom embedding
+    passing its own offset-aware datetime, and any row like that self-heals on its next
+    ``mark_delivery_*``/``retry_dead_deliveries`` write.
+    """
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC).isoformat()
+    return value.astimezone(UTC).isoformat()
+
+
 _UPSERT_SIGNAL = """
 INSERT INTO signals (
     id, schema_version, source, source_instance, kind, title, content,
@@ -291,9 +315,9 @@ class SQLiteSignalStore:
             event.content,
             event.author,
             event.url,
-            event.created_at.isoformat(),
-            event.updated_at.isoformat() if event.updated_at else None,
-            event.collected_at.isoformat(),
+            _utc_iso(event.created_at),
+            _utc_iso(event.updated_at) if event.updated_at else None,
+            _utc_iso(event.collected_at),
             json.dumps(dict(event.metadata), ensure_ascii=False, sort_keys=True),
             fingerprint,
         )
@@ -355,14 +379,14 @@ class SQLiteSignalStore:
             (
                 source_key,
                 cursor.to_json(),
-                updated_at.isoformat(),
-                last_success_at.isoformat() if last_success_at else None,
+                _utc_iso(updated_at),
+                _utc_iso(last_success_at) if last_success_at else None,
                 last_error,
             ),
         )
 
     def record_failure(self, source_key: str, error: str) -> None:
-        now = datetime.now(UTC).isoformat()
+        now = _utc_iso(datetime.now(UTC))
         with self._write_transaction():
             existing = self._connection.execute(
                 "SELECT cursor_json, last_success_at FROM checkpoints WHERE source_key = ?",
@@ -407,9 +431,9 @@ class SQLiteSignalStore:
                 (
                     health.source_key,
                     health.status,
-                    health.updated_at.isoformat(),
-                    health.last_attempt_at.isoformat() if health.last_attempt_at else None,
-                    health.last_success_at.isoformat() if health.last_success_at else None,
+                    _utc_iso(health.updated_at),
+                    _utc_iso(health.last_attempt_at) if health.last_attempt_at else None,
+                    _utc_iso(health.last_success_at) if health.last_success_at else None,
                     health.last_error,
                     health.consecutive_failures,
                     health.total_runs,
@@ -433,7 +457,7 @@ class SQLiteSignalStore:
     def register_delivery_sink(self, sink_key: str, *, backfill: bool = False) -> bool:
         if not sink_key.strip():
             raise ValueError("sink_key must not be empty")
-        now = datetime.now(UTC).isoformat()
+        now = _utc_iso(datetime.now(UTC))
         with self._write_transaction():
             existing = self._connection.execute(
                 "SELECT 1 FROM delivery_sinks WHERE sink_key = ?",
@@ -467,7 +491,7 @@ class SQLiteSignalStore:
         with self._connection:
             self._connection.execute(
                 "UPDATE delivery_sinks SET enabled = 0, updated_at = ? WHERE sink_key = ?",
-                (datetime.now(UTC).isoformat(), sink_key),
+                (_utc_iso(datetime.now(UTC)), sink_key),
             )
 
     def list_ready_deliveries(
@@ -477,7 +501,7 @@ class SQLiteSignalStore:
         limit: int = 100,
         now: datetime | None = None,
     ) -> list[DeliveryRecord]:
-        ready_at = (now or datetime.now(UTC)).isoformat()
+        ready_at = _utc_iso(now or datetime.now(UTC))
         rows = self._connection.execute(
             """
             SELECT * FROM deliveries
@@ -511,7 +535,7 @@ class SQLiteSignalStore:
                     updated_at = ?
                 WHERE sink_key = ? AND event_id = ?
                 """,
-                (when.isoformat(), when.isoformat(), sink_key, event_id),
+                (_utc_iso(when), _utc_iso(when), sink_key, event_id),
             )
 
     def mark_delivery_failure(
@@ -538,16 +562,16 @@ class SQLiteSignalStore:
                 """,
                 (
                     "dead" if dead else "failed",
-                    next_attempt_at.isoformat() if next_attempt_at and not dead else None,
+                    _utc_iso(next_attempt_at) if next_attempt_at and not dead else None,
                     error,
-                    when.isoformat(),
+                    _utc_iso(when),
                     sink_key,
                     event_id,
                 ),
             )
 
     def retry_dead_deliveries(self, sink_key: str) -> int:
-        now = datetime.now(UTC).isoformat()
+        now = _utc_iso(datetime.now(UTC))
         with self._connection:
             cursor = self._connection.execute(
                 """

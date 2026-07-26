@@ -1,7 +1,9 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.storage import SQLiteSignalStore
+
+PLUS_EIGHT = timezone(timedelta(hours=8))
 
 
 def make_event(content: str = "hello", *, collected_hour: int = 10) -> SignalEvent:
@@ -69,6 +71,82 @@ def test_delivery_ready_failure_dead_and_replay(tmp_path) -> None:
         assert store.delivery_counts("brain") == {"dead": 1}
         assert store.retry_dead_deliveries("brain") == 1
         assert store.delivery_counts("brain") == {"pending": 1}
+
+
+def test_non_utc_delivery_timestamps_are_normalized_before_comparison(tmp_path) -> None:
+    """A ``+08:00`` retry time used to sort by wall clock, stalling delivery for 8 hours."""
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.register_delivery_sink("brain")
+        store.write_many([make_event()])
+        store.mark_delivery_failure(
+            "brain",
+            "sig_outbox",
+            error="temporary",
+            next_attempt_at=datetime(2026, 7, 26, 12, 0, tzinfo=PLUS_EIGHT),  # 04:00Z
+            attempted_at=datetime(2026, 7, 26, 11, 0, tzinfo=PLUS_EIGHT),  # 03:00Z
+        )
+
+        stored = store._connection.execute(
+            "SELECT next_attempt_at, updated_at FROM deliveries"
+        ).fetchone()
+        assert stored["next_attempt_at"] == "2026-07-26T04:00:00+00:00"
+        assert stored["updated_at"] == "2026-07-26T03:00:00+00:00"
+
+        assert store.list_ready_deliveries("brain", now=datetime(2026, 7, 26, 3, 59, tzinfo=UTC)) == []
+        ready = store.list_ready_deliveries("brain", now=datetime(2026, 7, 26, 4, 1, tzinfo=UTC))
+        assert len(ready) == 1
+        assert ready[0].next_attempt_at == datetime(2026, 7, 26, 4, 0, tzinfo=UTC)
+        assert ready[0].updated_at == datetime(2026, 7, 26, 3, 0, tzinfo=UTC)
+
+        # A caller-supplied non-UTC "now" is normalized on the comparison side too.
+        assert store.list_ready_deliveries(
+            "brain", now=datetime(2026, 7, 26, 11, 59, tzinfo=PLUS_EIGHT)
+        ) == []
+        assert len(
+            store.list_ready_deliveries("brain", now=datetime(2026, 7, 26, 12, 1, tzinfo=PLUS_EIGHT))
+        ) == 1
+
+        store.mark_delivery_success(
+            "brain",
+            "sig_outbox",
+            delivered_at=datetime(2026, 7, 26, 20, 0, tzinfo=PLUS_EIGHT),  # 12:00Z
+        )
+        delivered = store._connection.execute(
+            "SELECT delivered_at, updated_at FROM deliveries"
+        ).fetchone()
+        assert delivered["delivered_at"] == "2026-07-26T12:00:00+00:00"
+        assert delivered["updated_at"] == "2026-07-26T12:00:00+00:00"
+
+
+def test_ready_deliveries_are_fifo_by_instant_not_by_wall_clock(tmp_path) -> None:
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.register_delivery_sink("brain")
+        store.write_many([other_event("sig_early"), other_event("sig_late")])
+
+        # sig_early is genuinely older (15:00Z) but its raw string sorts last.
+        store.mark_delivery_failure(
+            "brain",
+            "sig_early",
+            error="boom",
+            next_attempt_at=None,
+            attempted_at=datetime(2026, 7, 26, 23, 0, tzinfo=PLUS_EIGHT),  # 15:00Z
+        )
+        store.mark_delivery_failure(
+            "brain",
+            "sig_late",
+            error="boom",
+            next_attempt_at=None,
+            attempted_at=datetime(2026, 7, 26, 16, 0, tzinfo=UTC),  # 16:00Z
+        )
+
+        order = [
+            record.event_id
+            for record in store.list_ready_deliveries(
+                "brain", now=datetime(2026, 7, 27, tzinfo=UTC)
+            )
+        ]
+        assert order == ["sig_early", "sig_late"]
 
 
 def other_event(event_id: str, content: str = "hello") -> SignalEvent:

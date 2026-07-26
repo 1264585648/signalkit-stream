@@ -42,6 +42,7 @@ The runtime can execute one-shot cycles or remain alive as an independent ingest
 - `signalkit init`, `signalkit run`, `signalkit status`
 - text or structured JSON runtime logging
 - scheduler tests with injected sleep/clock functions rather than wall-clock waits
+- subprocess lifecycle tests through the real packaged CLI
 
 ## Delivery layer — implemented
 
@@ -59,6 +60,7 @@ Collection and downstream delivery are separated by a durable transactional outb
 - optional historical backfill when enabling a sink
 - independent delivery workers and graceful cancellation
 - protection against old in-flight deliveries acknowledging newer event versions
+- process-level replay evidence after abrupt death during a remote webhook side effect
 - `signalkit deliveries` and `signalkit retry-deliveries`
 
 The delivery contract is at-least-once. Consumers performing non-idempotent side effects should honor the supplied idempotency key.
@@ -105,6 +107,8 @@ All first-party collectors participate in shared deterministic contract tests in
 
 See:
 
+- `docs/ARCHITECTURE.md`
+- `docs/COMPATIBILITY.md`
 - `docs/MIGRATIONS.md`
 - `docs/BACKUP.md`
 - `docs/OBSERVABILITY.md`
@@ -112,6 +116,7 @@ See:
 - `docs/REDDIT.md`
 - `docs/LIVE_TESTING.md`
 - `docs/COLLECTOR_SDK.md`
+- `docs/RELEASE.md`
 
 ## Reliability evidence — implemented
 
@@ -130,25 +135,28 @@ The deterministic suite covers major failure boundaries including:
 - recovery after a competing writer releases the database
 - write-lock diagnostics under both available and busy states
 - consistent WAL backup of the last committed snapshot while another writer transaction is active
+- real CLI SIGTERM shutdown followed by restart and continued collection
+- real CLI abrupt kill during an in-flight webhook followed by durable outbox replay
+- identical event/version idempotency identity across the interrupted and replayed webhook attempts
 
 Live compatibility checks remain outside normal deterministic PR CI so third-party availability cannot decide whether a commit is correct.
 
-## Remaining 1.0 hardening
+## Release engineering — in final hardening
 
-The remaining work is deliberately narrow.
+The repository now includes:
 
-### 1. End-to-end process lifecycle evidence
+- explicit compatibility/deprecation policy
+- pre-1.0 changelog
+- release/upgrade checklist
+- version-consistency test between package metadata and runtime `__version__`
+- wheel + source-distribution build in CI
+- clean wheel installation/CLI/config-validation smoke
+- clean sdist installation/import/CLI smoke
+- reviewed architecture/operations/source-authoring documentation
 
-Add subprocess-level tests that start the real CLI/runtime process, stop or kill it at controlled points, reopen the real SQLite database, and prove the same restart invariants already covered by component-level fault injection:
+Normal CI builds release artifacts for inspection but intentionally does not publish packages or tags.
 
-- normal SIGTERM shutdown and restart
-- restart after a committed source cycle
-- abrupt termination with durable checkpoint/outbox recovery
-- no requirement to recollect a source merely because delivery was interrupted
-
-The goal is lifecycle evidence through the packaged operator boundary, not a second scheduler implementation.
-
-### 2. Migration compatibility matrix as versions accumulate
+## Migration compatibility matrix as versions accumulate
 
 Schema version 1 has legacy/unversioned migration coverage. When a second persistent database schema version ships, preserve representative fixtures for every supported released version and test upgrade-to-current while retaining:
 
@@ -162,23 +170,23 @@ Never add a downgrade path. Future-version databases must continue to fail close
 
 This work is intentionally triggered by a real schema-v2 change rather than inventing a no-op migration solely to satisfy a matrix.
 
-### 3. Release engineering and public compatibility policy
+## Remaining 1.0 closure
 
-Before the 1.0 tag:
+Before the 1.0 tag/publication:
 
-- final public Python/CLI API review
-- explicit compatibility/deprecation policy
-- clean wheel/sdist installation smoke test
-- changelog and 1.0 release notes
-- documented upgrade path from the latest pre-1.0 release
-- final architecture / operations / adapter-authoring documentation review
-- remove or close stale development branches/PRs that no longer represent current architecture
+- choose/finalize the exact 1.0 version commit
+- move `CHANGELOG.md` `Unreleased` entries under the 1.0 version/date and write final release notes
+- confirm the intended public Python/CLI/config surface against `docs/COMPATIBILITY.md`
+- run/inspect deterministic package gates on the exact release commit
+- inspect a recent live compatibility smoke separately from correctness CI
+- follow `docs/RELEASE.md` backup/upgrade/package inspection checklist
+- tag/publish as an explicit maintainer action; ordinary CI has no publish credentials
 
 ## 1.0 release gate
 
 SignalKit Stream reaches 1.0 when the module can be installed, configured, started, stopped, upgraded, diagnosed, backed up, restored, monitored, and left running as an independent ingestion service with explicit compatibility boundaries.
 
-Already satisfied:
+Engineering gates already satisfied:
 
 - core protocol and persistent checkpoint model
 - runtime scheduler and graceful lifecycle
@@ -192,11 +200,9 @@ Already satisfied:
 - deterministic multi-version Python CI
 - separate scheduled/manual live compatibility workflow
 - SQLite busy/lock operational hardening and single-writer guidance
+- real subprocess restart and delivery-replay lifecycle evidence
+- release-package clean-install gates and compatibility/release documentation
 
-Still required:
-
-- subprocess-level restart/lifecycle evidence
-- release-engineering and public compatibility closure
-- migration fixture expansion when more than one persistent schema version has actually shipped
+The only unconditional work left before calling a particular commit `1.0.0` is final release-version/release-note/API-signoff and the explicit tag/publish action. Migration fixture expansion remains conditional on a real second persistent schema version shipping.
 
 The 1.0 gate does not include LLM classification or business logic. Those belong to later SignalKit modules consuming the normalized event stream.

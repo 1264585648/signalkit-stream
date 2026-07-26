@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import sys
 
 from signalkit_stream.collectors import (
@@ -19,7 +20,10 @@ from signalkit_stream.collectors import (
 )
 from signalkit_stream.config import load_config, sample_config
 from signalkit_stream.diagnostics import DiagnosticReport, doctor, validate_config_file
+from signalkit_stream.logging_utils import configure_logging
+from signalkit_stream.maintenance import BackupResult, VerifyResult, backup_database, verify_database
 from signalkit_stream.models import SignalEvent
+from signalkit_stream.observability import format_snapshot, read_snapshot
 from signalkit_stream.pipeline import run_collector
 from signalkit_stream.runtime import StreamRuntime
 from signalkit_stream.storage import SQLiteSignalStore, SourceHealth
@@ -106,6 +110,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="Collect up to N top-level comments per post",
     )
+    reddit.add_argument("--access-token-env", default="REDDIT_ACCESS_TOKEN")
+    reddit.add_argument("--refresh-token-env", default="REDDIT_REFRESH_TOKEN")
     reddit.add_argument("--client-id-env", default="REDDIT_CLIENT_ID")
     reddit.add_argument("--client-secret-env", default="REDDIT_CLIENT_SECRET")
     reddit.add_argument("--user-agent-env", default="REDDIT_USER_AGENT")
@@ -134,6 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("config", nargs="?", default="signalkit.toml")
     run.add_argument("--once", action="store_true", help="Run one collection/delivery cycle and exit")
     run.add_argument("--verbose", action="store_true")
+    run.add_argument(
+        "--log-format",
+        choices=["text", "json"],
+        default="text",
+        help="Runtime log format (default: text)",
+    )
 
     show = subparsers.add_parser("show", help="Read normalized events from SQLite")
     show.add_argument("--db", default="signals.db")
@@ -147,9 +159,18 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("source_key", help="Source key such as hackernews:newstories")
     checkpoint.add_argument("--db", default="signals.db")
 
-    status = subparsers.add_parser("status", help="Inspect persisted runtime source health")
+    status = subparsers.add_parser("status", help="Inspect persisted runtime health")
     status.add_argument("--db", default="signals.db")
-    status.add_argument("--format", choices=["json", "table"], default="table")
+    status.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include database schema, stored-signal, source, sink, and delivery state",
+    )
+    status.add_argument(
+        "--format",
+        choices=["json", "table", "prometheus"],
+        default="table",
+    )
 
     deliveries = subparsers.add_parser("deliveries", help="Inspect durable delivery state")
     deliveries.add_argument("--db", default="signals.db")
@@ -162,6 +183,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retry_deliveries.add_argument("sink_key")
     retry_deliveries.add_argument("--db", default="signals.db")
+
+    database = subparsers.add_parser("db", help="SQLite backup and verification operations")
+    database_commands = database.add_subparsers(dest="db_command", required=True)
+
+    backup = database_commands.add_parser("backup", help="Create a consistent SQLite backup")
+    backup.add_argument("destination")
+    backup.add_argument("--db", default="signals.db", help="Source SQLite database")
+    backup.add_argument("--overwrite", action="store_true")
+    backup.add_argument("--format", choices=["json", "table"], default="table")
+
+    verify = database_commands.add_parser(
+        "verify",
+        help="Verify SQLite integrity and persistent schema compatibility",
+    )
+    verify.add_argument("--db", default="signals.db")
+    verify.add_argument("--format", choices=["json", "table"], default="table")
 
     return parser
 
@@ -231,7 +268,8 @@ def _format_health(items: Sequence[SourceHealth], output_format: str) -> str:
         success = item.last_success_at.isoformat(timespec="seconds") if item.last_success_at else "-"
         lines.append(
             f"{item.source_key[:32]:32} {item.status[:14]:14} "
-            f"{item.consecutive_failures:<7} {item.total_runs:<7} {item.total_events:<8} {success}"
+            f"{item.consecutive_failures:<7} {item.total_runs:<7} "
+            f"{item.total_events:<8} {success}"
         )
     return "\n".join(lines)
 
@@ -267,8 +305,36 @@ def _format_diagnostics(report: DiagnosticReport, output_format: str) -> str:
     for check in report.checks:
         lines.append(f"{check.status.value.upper():7} {check.name[:32]:32} {check.message}")
     lines.append(
-        f"result={'ok' if report.ok else 'failed'} warnings={report.warnings} failures={report.failures}"
+        f"result={'ok' if report.ok else 'failed'} "
+        f"warnings={report.warnings} failures={report.failures}"
     )
+    return "\n".join(lines)
+
+
+def _format_backup(result: BackupResult, output_format: str) -> str:
+    if output_format == "json":
+        return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
+    return (
+        f"backup: {result.source} -> {result.destination}\n"
+        f"pages: {result.pages}\n"
+        f"quick_check: {result.quick_check}\n"
+        f"schema_version: {result.schema_version}"
+    )
+
+
+def _format_verify(result: VerifyResult, output_format: str) -> str:
+    if output_format == "json":
+        return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
+    lines = [
+        f"database: {result.database}",
+        f"quick_check: {result.quick_check}",
+        f"pages: {result.page_count}",
+        f"page_size: {result.page_size}",
+        f"schema: {result.schema_version}/{result.supported_schema_version} "
+        f"({result.schema_status})",
+    ]
+    if result.schema_error:
+        lines.append(f"schema_error: {result.schema_error}")
     return "\n".join(lines)
 
 
@@ -295,11 +361,14 @@ async def _run_collect(args: argparse.Namespace) -> int:
             instance=args.instance,
         )
     elif args.collector == "reddit":
+        credentials = _reddit_credentials(args)
         collector = RedditCollector(
             args.subreddit,
-            client_id=_required_env(args.client_id_env),
-            client_secret=_required_env(args.client_secret_env),
-            user_agent=_required_env(args.user_agent_env),
+            access_token=credentials["access_token"],
+            refresh_token=credentials["refresh_token"],
+            client_id=credentials["client_id"],
+            client_secret=credentials["client_secret"],
+            user_agent=credentials["user_agent"] or "",
             listing=args.listing,
             time_filter=args.time_filter,
             include_comments=args.comments > 0,
@@ -325,8 +394,8 @@ async def _run_collect(args: argparse.Namespace) -> int:
         print(
             (
                 f"Collected {result.primary_count} primary items / {len(result.events)} events; "
-                f"inserted={result.inserted} updated={result.updated} unchanged={result.unchanged}; "
-                f"pages={result.pages}; db={args.db}"
+                f"inserted={result.inserted} updated={result.updated} "
+                f"unchanged={result.unchanged}; pages={result.pages}; db={args.db}"
             ),
             file=sys.stderr,
         )
@@ -335,11 +404,37 @@ async def _run_collect(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reddit_credentials(args: argparse.Namespace) -> dict[str, str | None]:
+    access_token = _optional_env(args.access_token_env)
+    refresh_token = _optional_env(args.refresh_token_env)
+    client_id = _optional_env(args.client_id_env)
+    client_secret = _optional_env(args.client_secret_env)
+
+    if refresh_token and not client_id:
+        client_id = _required_env(args.client_id_env)
+    if not access_token and not refresh_token:
+        client_id = client_id or _required_env(args.client_id_env)
+        client_secret = client_secret or _required_env(args.client_secret_env)
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "user_agent": _required_env(args.user_agent_env),
+    }
+
+
 def _required_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
         raise SystemExit(f"required environment variable is not set: {name}")
     return value
+
+
+def _optional_env(name: str) -> str | None:
+    value = os.getenv(name)
+    return value if value else None
 
 
 def _run_init(args: argparse.Namespace) -> int:
@@ -367,9 +462,10 @@ def _run_doctor(args: argparse.Namespace) -> int:
 
 async def _run_runtime(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    logging.basicConfig(
+    configure_logging(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        output_format=args.log_format,
+        force=True,
     )
     with SQLiteSignalStore(config.runtime.database) as store:
         runtime = StreamRuntime(config, store)
@@ -408,7 +504,8 @@ async def _run_runtime(args: argparse.Namespace) -> int:
                 )
             source_success = all(result.success for result in results)
             delivery_success = all(
-                result.failed == 0 and result.dead == 0 for result in runtime.last_delivery_results
+                result.failed == 0 and result.dead == 0
+                for result in runtime.last_delivery_results
             )
             return 0 if source_success and delivery_success else 1
 
@@ -466,6 +563,16 @@ def _run_checkpoint(args: argparse.Namespace) -> int:
 
 
 def _run_status(args: argparse.Namespace) -> int:
+    if args.verbose or args.format == "prometheus":
+        try:
+            snapshot = read_snapshot(args.db)
+        except (FileNotFoundError, sqlite3.Error) as exc:
+            print(f"status failed: {exc}", file=sys.stderr)
+            return 1
+        output = format_snapshot(snapshot, output_format=args.format)
+        print(output, end="" if args.format == "prometheus" else "\n")
+        return 0 if snapshot.schema_status == "current" else 1
+
     with SQLiteSignalStore(args.db) as store:
         health = store.list_source_health()
     print(_format_health(health, args.format))
@@ -484,6 +591,23 @@ def _run_retry_deliveries(args: argparse.Namespace) -> int:
         retried = store.retry_dead_deliveries(args.sink_key)
     print(f"Queued {retried} dead deliveries for retry on {args.sink_key}.")
     return 0
+
+
+def _run_db(args: argparse.Namespace) -> int:
+    try:
+        if args.db_command == "backup":
+            result = backup_database(args.db, args.destination, overwrite=args.overwrite)
+            print(_format_backup(result, args.format))
+            return 0
+        result = verify_database(args.db)
+        print(_format_verify(result, args.format))
+        return 0 if result.ok else 1
+    except (OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
+        if args.format == "json":
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+        else:
+            print(f"database operation failed: {exc}", file=sys.stderr)
+        return 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -508,6 +632,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_deliveries(args)
     if args.command == "retry-deliveries":
         return _run_retry_deliveries(args)
+    if args.command == "db":
+        return _run_db(args)
     return 2
 
 

@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from signalkit_stream.collectors.base import Collector
+from signalkit_stream.collectors.base import Collector, HTTPCollector
 from signalkit_stream.config import RuntimeConfig, SinkConfig, SourceConfig, StreamConfig
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import (
@@ -195,6 +195,109 @@ async def test_run_forever_stops_and_cancels_workers(tmp_path) -> None:
     assert sleeps == [10]
     assert health is not None
     assert health.total_runs == 1
+
+
+class RateLimitedCollector(HTTPCollector):
+    """Collector that always answers with a rate-limit error, like a bare HTTP 429."""
+
+    source = "limited"
+
+    def __init__(self, instance: str, *, snapshot: RateLimitSnapshot | None = None) -> None:
+        super().__init__()
+        self.instance = instance
+        self._rate_limit = snapshot
+
+    async def collect(self, *, context=None, cursor=None) -> CollectorResult:
+        raise CollectorError(
+            "HTTP 429 from upstream",
+            kind=CollectorErrorKind.RATE_LIMIT,
+            source_key=self.identity.key,
+            retryable=True,
+        )
+
+
+def limited_registry(snapshot: RateLimitSnapshot | None) -> CollectorRegistry:
+    registry = CollectorRegistry()
+    registry.register(
+        "limited",
+        lambda config: RateLimitedCollector(config.name, snapshot=snapshot),
+    )
+    return registry
+
+
+def limited_config(*, interval: float) -> StreamConfig:
+    return StreamConfig(
+        runtime=RuntimeConfig(
+            concurrency=1,
+            failure_threshold=5,
+            circuit_cooldown=300,
+            failure_backoff_base=5,
+        ),
+        sources=(SourceConfig("one", "limited", interval=interval, limit=1),),
+    )
+
+
+NOW = datetime(2026, 7, 25, 10, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "expected"),
+    [
+        (None, 60.0),
+        (RateLimitSnapshot(remaining=0, reset_at=NOW + timedelta(seconds=10)), 60.0),
+        (RateLimitSnapshot(retry_after=3600), 3600.0),
+    ],
+    ids=["no-hint", "hint-below-interval", "hint-above-interval"],
+)
+@pytest.mark.asyncio
+async def test_rate_limited_failure_never_polls_faster_than_the_interval(
+    tmp_path, snapshot, expected
+) -> None:
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(
+            limited_config(interval=60),
+            store,
+            registry=limited_registry(snapshot),
+            now=lambda: NOW,
+        )
+        result = (await runtime.run_once())[0]
+
+    assert result.status == "degraded"
+    assert result.delay == expected
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_hint_outlives_the_open_circuit(tmp_path) -> None:
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(
+            limited_config(interval=60),
+            store,
+            registry=limited_registry(RateLimitSnapshot(retry_after=3600)),
+            now=lambda: NOW,
+        )
+        results = [(await runtime.run_once())[0] for _ in range(6)]
+
+    assert [result.delay for result in results] == [3600.0] * 6
+    assert [result.status for result in results[:4]] == ["degraded"] * 4
+    assert results[4].status == "circuit_open"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_failure_keeps_backoff_below_the_poll_interval(tmp_path) -> None:
+    config = StreamConfig(
+        runtime=RuntimeConfig(
+            concurrency=1,
+            failure_threshold=5,
+            circuit_cooldown=300,
+            failure_backoff_base=5,
+        ),
+        sources=(SourceConfig("one", "fake", interval=3600, limit=1),),
+    )
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(config, store, registry=registry_for(fail=True))
+        delays = [(await runtime.run_once())[0].delay for _ in range(3)]
+
+    assert delays == [5, 10, 20]
 
 
 def test_runtime_rejects_duplicate_source_identity(tmp_path) -> None:

@@ -230,13 +230,40 @@ class StreamRuntime:
         return max(interval, self._rate_limit_delay(rate_limit))
 
     def _failure_delay(self, source: RuntimeSource, error: CollectorError) -> float:
-        if source.failures >= self.config.runtime.failure_threshold:
-            return self.config.runtime.circuit_cooldown
-        rate_limit = source.collector.rate_limit if isinstance(source.collector, HTTPCollector) else None
+        """Return how long to wait after a failed run.
+
+        Policy, in priority order:
+
+        1. A ``RATE_LIMIT`` error is an explicit slow-down signal and always wins. Its
+           delay is ``max(Retry-After/reset hint, source interval)``: the hint is
+           honoured in full even when it exceeds the poll interval or the circuit
+           cooldown, and a 429 that carries no hint still costs at least one full poll
+           interval. Answering "slow down" with traffic *faster* than the configured
+           interval is never correct.
+        2. An open circuit waits at least ``circuit_cooldown``, but never less than an
+           outstanding rate-limit hint -- cooldown is a floor for failing sources, not a
+           licence to ignore an endpoint that asked for an hour.
+        3. Ordinary (non rate-limited) failures keep exponential backoff clamped *down*
+           to the poll interval: ``min(interval, failure_backoff_base * 2**(n-1))``.
+           This is deliberately faster than the interval for long-interval sources: a
+           failed poll returned no data, the request budget it would have spent is
+           unused, and a source polled hourly should recover from a transient blip in
+           seconds rather than an hour. Sustained failure traffic is already bounded by
+           the circuit breaker in rule 2.
+        """
+
+        limited = 0.0
         if error.kind is CollectorErrorKind.RATE_LIMIT:
-            limited_delay = self._rate_limit_delay(rate_limit)
-            if limited_delay > 0:
-                return limited_delay
+            rate_limit = (
+                source.collector.rate_limit
+                if isinstance(source.collector, HTTPCollector)
+                else None
+            )
+            limited = max(self._rate_limit_delay(rate_limit), source.config.interval)
+        if source.failures >= self.config.runtime.failure_threshold:
+            return max(self.config.runtime.circuit_cooldown, limited)
+        if limited > 0:
+            return limited
         exponent = max(0, source.failures - 1)
         return min(
             source.config.interval,

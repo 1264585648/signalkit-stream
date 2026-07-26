@@ -8,7 +8,13 @@ import os
 import sys
 from typing import Awaitable, Callable
 
-from signalkit_stream.collectors import GitHubCollector, HackerNewsCollector, RedditCollector
+from signalkit_stream.collectors import (
+    GitHubCollector,
+    HackerNewsCollector,
+    JSONFeedCollector,
+    RSSCollector,
+    RedditCollector,
+)
 from signalkit_stream.pipeline import run_collector
 
 
@@ -55,38 +61,88 @@ async def _github() -> object:
     )
 
 
+async def _rss() -> SmokeResult:
+    url = os.getenv("SIGNALKIT_LIVE_RSS_URL")
+    if not url:
+        return SmokeResult(
+            "rss",
+            "skipped",
+            detail="SIGNALKIT_LIVE_RSS_URL is not configured",
+        )
+    return await _run_source(
+        "rss",
+        lambda: run_collector(RSSCollector(url, instance="live-smoke"), limit=1),
+    )
+
+
+async def _json_feed() -> SmokeResult:
+    url = os.getenv("SIGNALKIT_LIVE_JSON_FEED_URL")
+    if not url:
+        return SmokeResult(
+            "jsonfeed",
+            "skipped",
+            detail="SIGNALKIT_LIVE_JSON_FEED_URL is not configured",
+        )
+    return await _run_source(
+        "jsonfeed",
+        lambda: run_collector(JSONFeedCollector(url, instance="live-smoke"), limit=1),
+    )
+
+
 async def _reddit() -> SmokeResult:
-    required = {
-        "REDDIT_CLIENT_ID": os.getenv("REDDIT_CLIENT_ID"),
-        "REDDIT_CLIENT_SECRET": os.getenv("REDDIT_CLIENT_SECRET"),
-        "REDDIT_USER_AGENT": os.getenv("REDDIT_USER_AGENT"),
-    }
-    missing = [name for name, value in required.items() if not value]
-    if missing:
+    user_agent = os.getenv("REDDIT_USER_AGENT")
+    access_token = os.getenv("REDDIT_ACCESS_TOKEN")
+    refresh_token = os.getenv("REDDIT_REFRESH_TOKEN")
+    client_id = os.getenv("REDDIT_CLIENT_ID")
+    client_secret = os.getenv("REDDIT_CLIENT_SECRET")
+    subreddit = os.getenv("SIGNALKIT_LIVE_REDDIT_SUBREDDIT", "python")
+
+    if not user_agent:
         return SmokeResult(
             "reddit",
             "skipped",
-            detail="credentials not configured: " + ", ".join(missing),
+            detail="REDDIT_USER_AGENT is not configured",
         )
 
-    collector = RedditCollector(
-        "python",
-        client_id=required["REDDIT_CLIENT_ID"] or "",
-        client_secret=required["REDDIT_CLIENT_SECRET"] or "",
-        user_agent=required["REDDIT_USER_AGENT"] or "",
-        listing="new",
-        instance="live-smoke",
-    )
-    return await _run_source("reddit", lambda: run_collector(collector, limit=1))
+    has_static = bool(access_token)
+    has_refresh = bool(refresh_token and client_id)
+    has_app_only = bool(client_id and client_secret)
+    if not (has_static or has_refresh or has_app_only):
+        return SmokeResult(
+            "reddit",
+            "skipped",
+            detail=(
+                "OAuth credentials not configured; provide REDDIT_ACCESS_TOKEN, "
+                "REDDIT_REFRESH_TOKEN + REDDIT_CLIENT_ID, or "
+                "REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET"
+            ),
+        )
+
+    async def collect() -> object:
+        collector = RedditCollector(
+            subreddit,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            client_secret=client_secret,
+            user_agent=user_agent,
+            listing="new",
+            instance="live-smoke",
+        )
+        return await run_collector(collector, limit=1)
+
+    return await _run_source("reddit", collect)
 
 
 async def run_smoke() -> list[SmokeResult]:
-    hackernews, github = await asyncio.gather(
+    hackernews, github, rss, json_feed = await asyncio.gather(
         _run_source("hackernews", _hackernews),
         _run_source("github", _github),
+        _rss(),
+        _json_feed(),
     )
     reddit = await _reddit()
-    return [hackernews, github, reddit]
+    return [hackernews, github, rss, json_feed, reddit]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -102,13 +158,9 @@ def main(argv: list[str] | None = None) -> int:
             suffix = f" ({result.detail})" if result.detail else ""
             print(f"{result.source}: {result.status}; events={result.events}{suffix}")
 
-    required_failures = [
-        result for result in results if result.source in {"hackernews", "github"} and result.status != "passed"
-    ]
-    configured_reddit_failure = any(
-        result.source == "reddit" and result.status == "failed" for result in results
-    )
-    return 1 if required_failures or configured_reddit_failure else 0
+    # Missing optional configuration produces "skipped". Once a source is configured,
+    # a compatibility failure must fail the smoke workflow so it becomes visible.
+    return 1 if any(result.status == "failed" for result in results) else 0
 
 
 if __name__ == "__main__":

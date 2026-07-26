@@ -1,11 +1,19 @@
 from datetime import UTC, datetime
+import logging
+import sqlite3
 
 import pytest
 
 from signalkit_stream.collectors.base import Collector
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.pipeline import run_collector
-from signalkit_stream.protocol import CollectorContext, CollectorResult, Cursor
+from signalkit_stream.protocol import (
+    CollectorContext,
+    CollectorError,
+    CollectorErrorKind,
+    CollectorResult,
+    Cursor,
+)
 from signalkit_stream.storage import SQLiteSignalStore
 
 
@@ -63,3 +71,53 @@ async def test_pipeline_resumes_from_checkpoint(tmp_path) -> None:
         assert [event.id for event in first.events] == ["sig_0", "sig_1"]
         assert [event.id for event in second.events] == ["sig_2", "sig_3"]
         assert store.count() == 4
+
+
+class ExplodingCollector(Collector):
+    source = "fake"
+    instance = "exploding"
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def collect(self, *, context=None, cursor=None) -> CollectorResult:
+        raise self.error
+
+
+def _locked_record_failure(*args: object, **kwargs: object) -> None:
+    raise sqlite3.OperationalError("database is locked")
+
+
+@pytest.mark.asyncio
+async def test_failing_record_failure_does_not_replace_collector_error(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    collector_error = CollectorError(
+        "upstream returned HTTP 503",
+        kind=CollectorErrorKind.NETWORK,
+        source_key="fake:exploding",
+        retryable=True,
+    )
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        monkeypatch.setattr(store, "record_failure", _locked_record_failure)
+        with caplog.at_level(logging.ERROR, logger="signalkit_stream.pipeline"):
+            with pytest.raises(CollectorError) as excinfo:
+                await run_collector(ExplodingCollector(collector_error), limit=1, store=store)
+
+    assert excinfo.value is collector_error
+    assert "failed to record collection failure for source=fake:exploding" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_failing_record_failure_does_not_replace_unexpected_error(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    unexpected = ValueError("collector bug")
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        monkeypatch.setattr(store, "record_failure", _locked_record_failure)
+        with caplog.at_level(logging.ERROR, logger="signalkit_stream.pipeline"):
+            with pytest.raises(ValueError) as excinfo:
+                await run_collector(ExplodingCollector(unexpected), limit=1, store=store)
+
+    assert excinfo.value is unexpected
+    assert "failed to record collection failure for source=fake:exploding" in caplog.text

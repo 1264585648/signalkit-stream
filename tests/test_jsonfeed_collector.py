@@ -7,7 +7,12 @@ import pytest
 
 from signalkit_stream.collectors.jsonfeed import JSONFeedCollector
 from signalkit_stream.models import SignalKind
-from signalkit_stream.protocol import CollectorContext, CollectorError, CollectorErrorKind
+from signalkit_stream.protocol import (
+    CollectorContext,
+    CollectorError,
+    CollectorErrorKind,
+    Cursor,
+)
 
 
 def item(item_id: str, title: str, *, html: bool = False) -> dict[str, object]:
@@ -166,3 +171,123 @@ async def test_jsonfeed_rejects_unsupported_version() -> None:
             await collector.collect()
 
     assert caught.value.kind is CollectorErrorKind.PARSE
+
+
+@pytest.mark.asyncio
+async def test_jsonfeed_rejects_hostile_next_url_and_never_requests_it() -> None:
+    """A feed operator must not be able to steer the collector at another host."""
+
+    hostile = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(200, json=feed(item("one", "One"), next_url=hostile))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        collector = JSONFeedCollector("https://example.com/feed.json", client=client)
+        with pytest.raises(CollectorError) as caught:
+            await collector.collect(context=CollectorContext(limit=1))
+
+    assert caught.value.kind is CollectorErrorKind.PARSE
+    assert caught.value.retryable is False
+    assert "next_url" in str(caught.value)
+    assert caught.value.details["rejected_url"] == hostile
+    assert requested == ["https://example.com/feed.json"]
+
+
+@pytest.mark.asyncio
+async def test_jsonfeed_rejects_cross_scheme_and_cross_port_next_url() -> None:
+    for hostile in (
+        "http://example.com/page-2.json",
+        "https://example.com:8443/page-2.json",
+        "https://evil.example.com/page-2.json",
+        "https://example.com.evil.test/page-2.json",
+    ):
+        requested: list[str] = []
+
+        def handler(request: httpx.Request, target: str = hostile) -> httpx.Response:
+            requested.append(str(request.url))
+            return httpx.Response(200, json=feed(item("one", "One"), next_url=target))
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            collector = JSONFeedCollector("https://example.com/feed.json", client=client)
+            with pytest.raises(CollectorError) as caught:
+                await collector.collect(context=CollectorContext(limit=1))
+
+        assert caught.value.kind is CollectorErrorKind.PARSE, hostile
+        assert requested == ["https://example.com/feed.json"], hostile
+
+
+@pytest.mark.asyncio
+async def test_jsonfeed_accepts_relative_next_url_on_the_same_origin() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/feed.json":
+            return httpx.Response(200, json=feed(item("one", "One"), next_url="/page-2.json"))
+        return httpx.Response(200, json=feed(item("zero", "Zero")))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        collector = JSONFeedCollector("https://example.com/feed.json", client=client)
+        first = await collector.collect(context=CollectorContext(limit=1))
+
+    assert first.has_more is True
+    assert first.cursor is not None
+    assert first.cursor.state["page_url"] == "https://example.com/page-2.json"
+
+
+@pytest.mark.asyncio
+async def test_jsonfeed_rejects_poisoned_cursor_page_url_before_requesting_it() -> None:
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
+        requested.append(str(request.url))
+        return httpx.Response(200, json=feed())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        collector = JSONFeedCollector("https://example.com/feed.json", client=client)
+        poisoned = Cursor(
+            collector.identity.key,
+            {"page_url": "http://169.254.169.254/latest/meta-data/", "item_offset": 0},
+        )
+        with pytest.raises(CollectorError) as caught:
+            await collector.collect(cursor=poisoned)
+
+    assert caught.value.kind is CollectorErrorKind.CURSOR
+    assert requested == []
+
+
+@pytest.mark.asyncio
+async def test_jsonfeed_caps_next_url_follows_per_cycle() -> None:
+    pages = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pages
+        pages += 1
+        return httpx.Response(
+            200,
+            json=feed(
+                item(f"item-{pages}", f"Item {pages}"),
+                next_url=f"https://example.com/page-{pages + 1}.json",
+            ),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        collector = JSONFeedCollector(
+            "https://example.com/feed.json",
+            client=client,
+            max_page_follows=3,
+        )
+        result = await collector.collect(context=CollectorContext(limit=1))
+        follows = 0
+        while result.has_more:
+            follows += 1
+            assert follows <= 10, "pagination follows were never capped"
+            result = await collector.collect(
+                context=CollectorContext(limit=1),
+                cursor=result.cursor,
+            )
+
+    assert follows == 3
+    assert any("next_url" in warning for warning in result.warnings)
+    assert result.cursor is not None
+    assert result.cursor.state["page_url"] is None

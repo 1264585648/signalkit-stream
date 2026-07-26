@@ -300,6 +300,56 @@ async def test_ordinary_failure_keeps_backoff_below_the_poll_interval(tmp_path) 
     assert delays == [5, 10, 20]
 
 
+def sample_event(event_id: str) -> SignalEvent:
+    return SignalEvent(
+        id=event_id,
+        source="fake",
+        source_instance="one",
+        kind=SignalKind.POST,
+        content="reconcile",
+        url=f"https://example.com/{event_id}",
+        created_at=NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    "keep_disabled",
+    [False, True],
+    ids=["removed-from-config", "disabled-in-config"],
+)
+def test_sink_dropped_from_config_stops_queueing_pending_deliveries(
+    tmp_path, keep_disabled
+) -> None:
+    received: list[str] = []
+    sink_registry = SinkRegistry()
+    sink_registry.register("fake-sink", lambda config: FakeSink(config.name, received))
+    database = tmp_path / "signals.db"
+    source = SourceConfig("one", "fake", interval=60, limit=1)
+    with_both = StreamConfig(
+        sources=(source,),
+        sinks=(SinkConfig("brain", "fake-sink"), SinkConfig("archive", "fake-sink")),
+    )
+    remaining_sinks: tuple[SinkConfig, ...] = (SinkConfig("brain", "fake-sink"),)
+    if keep_disabled:
+        remaining_sinks += (SinkConfig("archive", "fake-sink", enabled=False),)
+    without_archive = StreamConfig(sources=(source,), sinks=remaining_sinks)
+
+    with SQLiteSignalStore(database) as store:
+        StreamRuntime(with_both, store, registry=registry_for(), sink_registry=sink_registry)
+        store.write_many([sample_event("sig_before")])
+        assert store.get_delivery("archive", "sig_before") is not None
+
+    with SQLiteSignalStore(database) as store:
+        StreamRuntime(without_archive, store, registry=registry_for(), sink_registry=sink_registry)
+        store.write_many([sample_event("sig_after")])
+        archive_after = store.get_delivery("archive", "sig_after")
+        brain_after = store.get_delivery("brain", "sig_after")
+
+    assert archive_after is None
+    assert brain_after is not None
+    assert brain_after.status == "pending"
+
+
 def test_runtime_rejects_duplicate_source_identity(tmp_path) -> None:
     registry = CollectorRegistry()
     registry.register("fake", lambda config: FakeCollector("same"))

@@ -73,6 +73,7 @@ class StreamRuntime:
         self.sinks = tuple(self.sink_registry.create(sink) for sink in enabled_sink_configs)
         for sink_config, sink in zip(enabled_sink_configs, self.sinks, strict=True):
             self.store.register_delivery_sink(sink.key, backfill=sink_config.backfill)
+        self._reconcile_delivery_sinks(frozenset(sink.key for sink in self.sinks))
         self.delivery = DeliveryEngine(
             self.store,
             self.sinks,
@@ -86,6 +87,37 @@ class StreamRuntime:
         )
         self.last_delivery_results: list[DeliveryResult] = []
         self._restore_health()
+
+    def _reconcile_delivery_sinks(self, active_keys: frozenset[str]) -> None:
+        """Disable database sinks that this configuration no longer drains.
+
+        ``register_delivery_sink`` only ever enables rows, so a sink that an operator
+        removes from the config (or flips to ``enabled = false``) keeps its row at
+        ``enabled = 1``. The insert/update triggers then keep queueing ``pending``
+        delivery rows that no worker will ever drain, growing ``deliveries`` without
+        bound. Reconciling at startup makes the database follow the config in both
+        directions. Rows queued *before* the sink was removed are intentionally left
+        alone: draining or pruning historical backlog is an operator decision
+        (``signalkit retry-deliveries`` / maintenance), not a startup side effect.
+        """
+
+        for key in self._enabled_delivery_sink_keys():
+            if key in active_keys:
+                continue
+            logger.warning(
+                "sink=%s disabled: not present as an enabled sink in the current configuration",
+                key,
+            )
+            self.store.disable_delivery_sink(key)
+
+    def _enabled_delivery_sink_keys(self) -> tuple[str, ...]:
+        connection = getattr(self.store, "_connection", None)
+        if connection is None:  # pragma: no cover - non-SQLite stores cannot be reconciled
+            return ()
+        rows = connection.execute(
+            "SELECT sink_key FROM delivery_sinks WHERE enabled = 1 ORDER BY sink_key"
+        ).fetchall()
+        return tuple(str(row[0]) for row in rows)
 
     def _restore_health(self) -> None:
         for source in self.sources:

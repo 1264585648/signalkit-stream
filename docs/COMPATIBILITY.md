@@ -8,7 +8,7 @@ The current supported interpreter matrix is Python 3.11, 3.12, and 3.13. Normal 
 
 ## Public Python API
 
-The intended public Python surface is the set of documented objects exported from the `signalkit_stream` package plus documented collector/sink extension contracts.
+The intended public Python surface is the set of documented objects exported from the `signalkit_stream` package plus documented collector/sink extension contracts. `docs/PUBLIC_API.md` is the explicit 1.0 inventory reviewed by deterministic compatibility tests.
 
 Modules/classes/functions whose names begin with `_` are implementation details and are not compatibility promises.
 
@@ -22,7 +22,7 @@ Starting with 1.0, the project intends to follow semantic-versioning expectation
 
 ## CLI compatibility
 
-Documented top-level commands and automation-oriented output are part of the operator surface.
+Documented top-level commands and automation-oriented output are part of the operator surface. The required 1.0 command/subcommand/options subset is also inventoried in `docs/PUBLIC_API.md` and exercised in CI.
 
 At 1.0:
 

@@ -221,3 +221,61 @@ def test_register_sink_can_backfill_existing_events(tmp_path) -> None:
             ]
         )
         assert store.get_delivery("archive", "sig_after_disable") is None
+
+
+def test_reenabling_a_disabled_sink_backfills_the_gap(tmp_path) -> None:
+    """Events collected while a sink was disabled have no delivery row at all."""
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        assert store.register_delivery_sink("brain") is True
+        store.write_many([other_event("sig_before")])
+        store.mark_delivery_success("brain", "sig_before")
+
+        store.disable_delivery_sink("brain")
+        store.write_many([other_event("sig_during")])
+        assert store.get_delivery("brain", "sig_during") is None
+
+        # Re-registration is not a first-time registration, and does not ask to backfill.
+        assert store.register_delivery_sink("brain") is False
+
+        gap = store.get_delivery("brain", "sig_during")
+        assert gap is not None
+        assert gap.status == "pending"
+        assert gap.attempts == 0
+        # The already-delivered row is left exactly as it was.
+        already = store.get_delivery("brain", "sig_before")
+        assert already.status == "delivered"
+        assert already.attempts == 1
+
+
+def test_reenabling_a_sink_does_not_reset_a_failed_delivery(tmp_path) -> None:
+    retry_at = datetime(2026, 7, 25, 14, 0, tzinfo=UTC)
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.register_delivery_sink("brain")
+        store.write_many([other_event("sig_failed")])
+        store.mark_delivery_failure(
+            "brain",
+            "sig_failed",
+            error="temporary",
+            next_attempt_at=retry_at,
+            attempted_at=datetime(2026, 7, 25, 13, 0, tzinfo=UTC),
+        )
+
+        store.disable_delivery_sink("brain")
+        store.register_delivery_sink("brain")
+
+        failed = store.get_delivery("brain", "sig_failed")
+        assert failed.status == "failed"
+        assert failed.attempts == 1
+        assert failed.next_attempt_at == retry_at
+        assert failed.last_error == "temporary"
+
+
+def test_repeated_registration_of_an_enabled_sink_does_not_backfill(tmp_path) -> None:
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        store.write_many([other_event("sig_existing")])
+        assert store.register_delivery_sink("brain") is True
+        assert store.get_delivery("brain", "sig_existing") is None
+
+        assert store.register_delivery_sink("brain") is False
+        assert store.get_delivery("brain", "sig_existing") is None

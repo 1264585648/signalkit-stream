@@ -455,12 +455,23 @@ class SQLiteSignalStore:
         return [self._row_to_health(row) for row in rows]
 
     def register_delivery_sink(self, sink_key: str, *, backfill: bool = False) -> bool:
+        """Enable a delivery sink, returning ``True`` only for a first-time registration.
+
+        While a sink is disabled the outbox triggers skip it, so every event collected in
+        that window has no delivery row at all. Re-enabling therefore always backfills,
+        regardless of ``backfill``: without it those events would never be delivered to
+        this sink, silently breaking at-least-once for the whole disabled window. The
+        backfill is ``ON CONFLICT DO NOTHING``, so it only ever fills genuine holes and
+        never resets a delivery row that already exists (delivered rows stay delivered,
+        failed rows keep their attempt count and retry schedule).
+        """
+
         if not sink_key.strip():
             raise ValueError("sink_key must not be empty")
         now = _utc_iso(datetime.now(UTC))
         with self._write_transaction():
             existing = self._connection.execute(
-                "SELECT 1 FROM delivery_sinks WHERE sink_key = ?",
+                "SELECT enabled FROM delivery_sinks WHERE sink_key = ?",
                 (sink_key,),
             ).fetchone()
             self._connection.execute(
@@ -473,7 +484,8 @@ class SQLiteSignalStore:
                 """,
                 (sink_key, now, now),
             )
-            if backfill:
+            was_disabled = existing is not None and not int(existing["enabled"])
+            if backfill or was_disabled:
                 self._connection.execute(
                     """
                     INSERT INTO deliveries (

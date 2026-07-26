@@ -5,6 +5,7 @@ from typing import Literal, Mapping
 
 import httpx
 
+from signalkit_stream.collectors._text import validated_seen_window
 from signalkit_stream.collectors._reddit_impl import (
     DEFAULT_COMMENT_CONCURRENCY,
     RedditCollector as _RedditCollector,
@@ -109,7 +110,7 @@ class RedditCollector(_RedditCollector):
         if comment_concurrency < 1:
             raise ValueError("Reddit comment_concurrency must be >= 1")
         self.comment_concurrency = comment_concurrency
-        self.seen_window = max(50, seen_window)
+        self.seen_window = validated_seen_window(seen_window, label="Reddit")
         self.source = "reddit"
         self.instance = instance or f"r-{self.subreddit}-{self.listing}"
         self._access_token: str | None = None

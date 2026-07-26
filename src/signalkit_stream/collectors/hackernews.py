@@ -6,7 +6,7 @@ from typing import Any, Literal, Mapping
 
 import httpx
 
-from signalkit_stream.collectors._text import html_to_text
+from signalkit_stream.collectors._text import html_to_text, validated_seen_window
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import (
@@ -53,7 +53,7 @@ class HackerNewsCollector(HTTPCollector):
         if comment_concurrency < 1:
             raise ValueError("Hacker News comment_concurrency must be >= 1")
         self.comment_concurrency = comment_concurrency
-        self.seen_window = max(50, seen_window)
+        self.seen_window = validated_seen_window(seen_window, label="Hacker News")
         self.source = "hackernews"
         self.instance = feed
 

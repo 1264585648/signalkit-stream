@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from signalkit_stream.collectors._text import html_to_text, redact_url
+from signalkit_stream.collectors._text import html_to_text, redact_url, validated_seen_window
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import (
@@ -56,7 +56,7 @@ class JSONFeedCollector(HTTPCollector):
         self.source = source
         self.exported_url = redact_url(self.url)
         self.instance = instance or self.exported_url
-        self.seen_window = max(50, seen_window)
+        self.seen_window = validated_seen_window(seen_window, label="JSON Feed")
         self.max_page_follows = max_page_follows
 
     async def collect(

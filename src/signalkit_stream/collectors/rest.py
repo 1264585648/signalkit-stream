@@ -6,7 +6,7 @@ from typing import Any, Literal, Mapping
 
 import httpx
 
-from signalkit_stream.collectors._text import redact_url
+from signalkit_stream.collectors._text import redact_url, validated_seen_window
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import (
@@ -84,8 +84,7 @@ class GenericRESTCollector(HTTPCollector):
                 raise ValueError("REST cursor_param must not be empty for cursor pagination")
             if not next_cursor_path or not next_cursor_path.strip():
                 raise ValueError("REST next_cursor_path is required for cursor pagination")
-        if seen_window < 100:
-            raise ValueError("REST seen_window must be >= 100")
+        seen_window = validated_seen_window(seen_window, label="REST")
 
         super().__init__(client=client, timeout=timeout, retry_policy=retry_policy)
         self.url = url

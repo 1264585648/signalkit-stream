@@ -1,8 +1,29 @@
+"""Helpers shared by the first-party collectors."""
+
 from __future__ import annotations
 
 from html.parser import HTMLParser
 import re
 from urllib.parse import urlsplit, urlunsplit
+
+MIN_SEEN_WINDOW = 50
+"""Smallest dedup window any adapter accepts for its ``seen_window`` option."""
+
+
+def validated_seen_window(value: int, *, label: str) -> int:
+    """Return ``value`` unchanged, or raise ``ValueError`` if it is unusable.
+
+    Every adapter shares this one contract: ``seen_window`` is validated, never
+    silently reinterpreted. Clamping (``max(50, seen_window)``) would hand the
+    operator a different dedup window than the one they configured, and a window
+    that is too small quietly turns into repeated re-emission of old items.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} seen_window must be an integer")
+    if value < MIN_SEEN_WINDOW:
+        raise ValueError(f"{label} seen_window must be >= {MIN_SEEN_WINDOW}")
+    return value
 
 
 class _TextExtractor(HTMLParser):

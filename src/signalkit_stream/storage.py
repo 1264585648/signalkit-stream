@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from signalkit_stream._storage_v0 import (
+from signalkit_stream._storage_impl import (
     Checkpoint,
     DeliveryRecord,
     SignalStore,

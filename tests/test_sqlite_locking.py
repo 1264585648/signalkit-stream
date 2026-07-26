@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 
 from signalkit_stream.diagnostics import DiagnosticStatus, doctor
+from signalkit_stream.maintenance import backup_database
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.sqlite_ops import probe_write_lock
 from signalkit_stream.storage import SQLiteSignalStore
@@ -128,3 +129,41 @@ def test_doctor_reports_write_lock_pass_and_busy_warning(tmp_path) -> None:
         check for check in recovered.checks if check.name == "database-write-lock"
     )
     assert recovered_lock.status is DiagnosticStatus.PASS
+
+
+def test_wal_backup_reads_last_committed_snapshot_while_writer_is_active(tmp_path) -> None:
+    database = tmp_path / "signals.db"
+    backup = tmp_path / "backup.db"
+    with SQLiteSignalStore(database) as store:
+        store.write_many([event("one")])
+
+    writer = sqlite3.connect(database)
+    try:
+        mode = str(writer.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+        assert mode == "wal"
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            "UPDATE signals SET content = ? WHERE id = ?",
+            ("uncommitted", "one"),
+        )
+
+        result = backup_database(database, backup)
+        assert result.quick_check == "ok"
+
+        with SQLiteSignalStore(backup) as store:
+            backed_up = store.get("one")
+            assert backed_up is not None
+            assert backed_up.content == "event one"
+
+        with SQLiteSignalStore(database, timeout=0) as reader:
+            current = reader.get("one")
+            assert current is not None
+            assert current.content == "event one"
+    finally:
+        writer.rollback()
+        writer.close()
+
+    with SQLiteSignalStore(database) as store:
+        current = store.get("one")
+        assert current is not None
+        assert current.content == "event one"

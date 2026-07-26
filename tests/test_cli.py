@@ -1,9 +1,17 @@
+import asyncio
 from datetime import UTC, datetime
 import json
+import signal
 
 import pytest
 
-from signalkit_stream.cli import _reddit_credentials, build_parser, main
+from signalkit_stream.cli import (
+    _reddit_credentials,
+    _shutdown_signals,
+    _stop_signals,
+    build_parser,
+    main,
+)
 from signalkit_stream.models import SignalEvent, SignalKind
 from signalkit_stream.protocol import Cursor
 from signalkit_stream.storage import SQLiteSignalStore, SourceHealth
@@ -254,3 +262,78 @@ feed = "newstories"
     table_output = capsys.readouterr().out
     assert "database-integrity" in table_output
     assert "PASS" in table_output
+
+
+class _RecordingLoop:
+    """Minimal event-loop stand-in for the shutdown-signal helpers."""
+
+    def __init__(self, *, supports_add_signal_handler: bool) -> None:
+        self.supports_add_signal_handler = supports_add_signal_handler
+        self.added: list[int] = []
+        self.removed: list[int] = []
+        self.threadsafe_calls = 0
+
+    def add_signal_handler(self, signum, callback):  # noqa: ANN001, ANN202
+        if not self.supports_add_signal_handler:
+            raise NotImplementedError
+        self.added.append(signum)
+        self._callback = callback
+
+    def remove_signal_handler(self, signum):  # noqa: ANN001, ANN202
+        self.removed.append(signum)
+        return True
+
+    def call_soon_threadsafe(self, callback, *args):  # noqa: ANN001, ANN202
+        self.threadsafe_calls += 1
+        callback(*args)
+
+
+def test_shutdown_signals_cover_every_catchable_stop_signal() -> None:
+    signals = _shutdown_signals()
+
+    assert signal.SIGINT in signals
+    assert signal.SIGTERM in signals
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is None:
+        assert len(signals) == 2
+    else:
+        # Windows delivers CTRL_BREAK_EVENT as SIGBREAK.
+        assert sigbreak in signals
+
+
+def test_stop_signals_prefers_loop_handlers_and_removes_them() -> None:
+    loop = _RecordingLoop(supports_add_signal_handler=True)
+    stop = asyncio.Event()
+    before = {signum: signal.getsignal(signum) for signum in _shutdown_signals()}
+
+    with _stop_signals(loop, stop):
+        assert loop.added == list(_shutdown_signals())
+        for signum, handler in before.items():
+            assert signal.getsignal(signum) is handler
+
+    assert loop.removed == list(_shutdown_signals())
+    for signum, handler in before.items():
+        assert signal.getsignal(signum) is handler
+
+
+def test_stop_signals_falls_back_to_signal_signal_and_wakes_loop_threadsafe() -> None:
+    loop = _RecordingLoop(supports_add_signal_handler=False)
+    stop = asyncio.Event()
+    before = {signum: signal.getsignal(signum) for signum in _shutdown_signals()}
+
+    with _stop_signals(loop, stop):
+        assert loop.added == []
+        installed = signal.getsignal(signal.SIGINT)
+        assert callable(installed)
+        assert installed is not before[signal.SIGINT]
+
+        installed(signal.SIGINT, None)
+
+        assert stop.is_set()
+        assert loop.threadsafe_calls == 1
+        # A second Ctrl+C must still force-quit, so the prior disposition is restored
+        # as soon as the first one is handled.
+        assert signal.getsignal(signal.SIGINT) is before[signal.SIGINT]
+
+    for signum, handler in before.items():
+        assert signal.getsignal(signum) is handler

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+import contextlib
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ from pathlib import Path
 import signal
 import sqlite3
 import sys
+from types import FrameType
 
 from signalkit_stream.collectors import (
     GitHubCollector,
@@ -460,6 +462,70 @@ def _run_doctor(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+_SignalHandler = Callable[[int, FrameType | None], object] | int | signal.Handlers | None
+
+
+def _shutdown_signals() -> tuple[signal.Signals, ...]:
+    """Return the signals this platform can use to request a graceful stop.
+
+    POSIX supervisors use SIGINT/SIGTERM. Windows cannot deliver a catchable SIGTERM at
+    all: ``TerminateProcess`` (what ``Popen.terminate()`` calls) is not interceptable, and
+    the only catchable supervisor-initiated stop is ``CTRL_BREAK_EVENT``, which Python
+    surfaces as ``SIGBREAK``. SIGBREAK only exists on Windows, so POSIX is unaffected.
+    """
+
+    signals: list[signal.Signals] = [signal.SIGINT, signal.SIGTERM]
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:
+        signals.append(sigbreak)
+    return tuple(signals)
+
+
+@contextlib.contextmanager
+def _stop_signals(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> Iterator[None]:
+    """Set ``stop`` when a shutdown signal arrives, restoring prior handlers on exit.
+
+    ``loop.add_signal_handler`` is POSIX-only and raises ``NotImplementedError`` on
+    Windows, so this falls back to ``signal.signal``. The fallback hops through
+    ``loop.call_soon_threadsafe`` because that writes to the loop's self-pipe, which is
+    what wakes a proactor loop blocked in ``GetQueuedCompletionStatus``.
+    """
+
+    loop_installed: list[signal.Signals] = []
+    previous: dict[int, _SignalHandler] = {}
+
+    def _request_stop(signum: int, frame: FrameType | None) -> None:
+        # Capturing SIGINT replaces default_int_handler, so restore the prior disposition
+        # immediately: a second Ctrl+C must still force-quit a shutdown that hangs.
+        with contextlib.suppress(OSError, ValueError):
+            signal.signal(signum, previous.get(signum, signal.SIG_DFL))
+        previous.pop(signum, None)
+        loop.call_soon_threadsafe(stop.set)
+
+    for signum in _shutdown_signals():
+        try:
+            loop.add_signal_handler(signum, stop.set)
+        except (NotImplementedError, RuntimeError, OSError, ValueError):
+            pass
+        else:
+            loop_installed.append(signum)
+            continue
+        try:
+            previous[signum] = signal.signal(signum, _request_stop)
+        except (OSError, ValueError):
+            # Unsupported signal number, or not running in the main thread.
+            continue
+    try:
+        yield
+    finally:
+        for signum in loop_installed:
+            with contextlib.suppress(NotImplementedError, RuntimeError):
+                loop.remove_signal_handler(signum)
+        for signum, handler in list(previous.items()):
+            with contextlib.suppress(OSError, ValueError):
+                signal.signal(signum, handler)
+
+
 async def _run_runtime(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     configure_logging(
@@ -510,19 +576,8 @@ async def _run_runtime(args: argparse.Namespace) -> int:
             return 0 if source_success and delivery_success else 1
 
         stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        installed: list[signal.Signals] = []
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(signum, stop.set)
-                installed.append(signum)
-            except (NotImplementedError, RuntimeError):
-                pass
-        try:
+        with _stop_signals(asyncio.get_running_loop(), stop):
             await runtime.run_forever(stop)
-        finally:
-            for signum in installed:
-                loop.remove_signal_handler(signum)
     return 0
 
 

@@ -4,7 +4,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -155,13 +157,32 @@ def _command(config: Path, *extra: str) -> list[str]:
 
 
 def _start(config: Path) -> subprocess.Popen[str]:
+    kwargs: dict[str, object] = {}
+    if sys.platform == "win32":
+        # GenerateConsoleCtrlEvent can only target a process group, so the child needs
+        # its own group before a graceful CTRL_BREAK_EVENT can reach it.
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     return subprocess.Popen(
         _command(config),
         cwd=Path(__file__).resolve().parents[1],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        **kwargs,  # type: ignore[arg-type]
     )
+
+
+def _request_graceful_stop(process: subprocess.Popen[str]) -> None:
+    """Ask the runtime to shut down gracefully in a platform-portable way.
+
+    ``Popen.terminate()`` on Windows is ``TerminateProcess``, which no handler can
+    intercept, so a graceful stop must be requested with ``CTRL_BREAK_EVENT``.
+    """
+
+    if sys.platform == "win32":
+        os.kill(process.pid, signal.CTRL_BREAK_EVENT)
+    else:
+        process.terminate()
 
 
 def _wait_for(
@@ -220,7 +241,7 @@ def _pending_delivery(database: Path) -> bool:
     return row == ("pending", 0)
 
 
-def test_graceful_sigterm_persists_progress_and_restart_collects_new_item(tmp_path) -> None:
+def test_graceful_stop_persists_progress_and_restart_collects_new_item(tmp_path) -> None:
     database = tmp_path / "signals.db"
     config = tmp_path / "signalkit.toml"
 
@@ -229,7 +250,7 @@ def test_graceful_sigterm_persists_progress_and_restart_collects_new_item(tmp_pa
         process = _start(config)
         try:
             _wait_for(lambda: _committed_source_cycle(database), process=process)
-            process.terminate()
+            _request_graceful_stop(process)
             stdout, stderr = process.communicate(timeout=10)
             assert process.returncode == 0, f"stdout:\n{stdout}\nstderr:\n{stderr}"
         finally:

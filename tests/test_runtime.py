@@ -1,5 +1,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+import logging
+import sqlite3
 
 import pytest
 
@@ -348,6 +350,114 @@ def test_sink_dropped_from_config_stops_queueing_pending_deliveries(
     assert archive_after is None
     assert brain_after is not None
     assert brain_after.status == "pending"
+
+
+async def immediate_sleep(delay: float) -> None:
+    await asyncio.sleep(0)
+
+
+class CountingCollector(FakeCollector):
+    def __init__(self, instance: str, *, on_collect) -> None:
+        super().__init__(instance)
+        self._on_collect = on_collect
+
+    async def collect(self, *, context=None, cursor=None) -> CollectorResult:
+        result = await super().collect(context=context, cursor=cursor)
+        self._on_collect()
+        return result
+
+
+@pytest.mark.asyncio
+async def test_source_loop_survives_unexpected_iteration_failure(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    stop = asyncio.Event()
+    collected: list[int] = []
+
+    def on_collect() -> None:
+        collected.append(len(collected) + 1)
+        if len(collected) >= 3:
+            stop.set()
+
+    registry = CollectorRegistry()
+    registry.register(
+        "counting",
+        lambda config: CountingCollector(config.name, on_collect=on_collect),
+    )
+    config = StreamConfig(
+        runtime=RuntimeConfig(concurrency=1),
+        sources=(SourceConfig("one", "counting", interval=0.01, limit=1),),
+    )
+
+    def locked(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        monkeypatch.setattr(store, "upsert_source_health", locked)
+        runtime = StreamRuntime(config, store, registry=registry, sleep=immediate_sleep)
+        with caplog.at_level(logging.ERROR, logger="signalkit_stream.runtime"):
+            await asyncio.wait_for(runtime.run_forever(stop), timeout=10)
+
+    assert len(collected) >= 3
+    assert "iteration failed unexpectedly" in caplog.text
+    assert "database is locked" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_forever_reports_a_worker_that_ends_on_its_own(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    stop = asyncio.Event()
+
+    async def ends_immediately(source, stop_event) -> None:
+        return None
+
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(config_for(), store, registry=registry_for())
+        monkeypatch.setattr(runtime, "_source_loop", ends_immediately)
+        with caplog.at_level(logging.ERROR, logger="signalkit_stream.runtime"):
+            with pytest.raises(RuntimeError, match="ended unexpectedly"):
+                await asyncio.wait_for(runtime.run_forever(stop), timeout=10)
+
+    assert "ended on its own" in caplog.text
+    assert stop.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_run_forever_reports_a_worker_that_dies_and_stops_its_siblings(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    stop = asyncio.Event()
+    cancelled: list[str] = []
+
+    async def loop_for(source, stop_event) -> None:
+        if source.config.name == "boom":
+            raise ZeroDivisionError("worker exploded")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(source.config.name)
+            raise
+
+    registry = CollectorRegistry()
+    registry.register("fake", lambda config: FakeCollector(config.name))
+    config = StreamConfig(
+        runtime=RuntimeConfig(concurrency=2),
+        sources=(
+            SourceConfig("healthy", "fake", interval=60, limit=1),
+            SourceConfig("boom", "fake", interval=60, limit=1),
+        ),
+    )
+    with SQLiteSignalStore(tmp_path / "signals.db") as store:
+        runtime = StreamRuntime(config, store, registry=registry)
+        monkeypatch.setattr(runtime, "_source_loop", loop_for)
+        with caplog.at_level(logging.ERROR, logger="signalkit_stream.runtime"):
+            with pytest.raises(ZeroDivisionError, match="worker exploded"):
+                await asyncio.wait_for(runtime.run_forever(stop), timeout=10)
+
+    assert cancelled == ["healthy"]
+    assert stop.is_set() is True
+    assert "died with an unhandled exception" in caplog.text
 
 
 def test_runtime_rejects_duplicate_source_identity(tmp_path) -> None:

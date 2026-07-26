@@ -137,7 +137,16 @@ class StreamRuntime:
         return results
 
     async def run_forever(self, stop_event: asyncio.Event | None = None) -> None:
-        """Run independent source and sink workers until stopped."""
+        """Run independent source and sink workers until stopped.
+
+        The supervisor waits on the workers *and* the stop event. A worker that ends on
+        its own is a defect rather than normal operation -- every source iteration is
+        individually guarded (see ``_source_loop``) -- so its exit is logged and the
+        whole runtime shuts down and re-raises instead of leaving a process that looks
+        healthy while collecting nothing. Restart is deliberately delegated to the
+        process supervisor (systemd/docker/k8s), which owns restart backoff and crash
+        looping policy; an in-process restart loop would hide the defect and could spin.
+        """
 
         stop = stop_event or asyncio.Event()
         tasks = [
@@ -148,20 +157,88 @@ class StreamRuntime:
             tasks.append(asyncio.create_task(self.delivery.run_forever(stop), name="signalkit:delivery"))
         if not tasks:
             return
+        stop_task = asyncio.create_task(stop.wait(), name="signalkit:stop")
+        dead_worker_error: BaseException | None = None
         try:
-            await stop.wait()
+            done, _pending = await asyncio.wait(
+                {*tasks, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            dead_worker_error = self._dead_worker_error(
+                done,
+                stop_task=stop_task,
+                stopping=stop.is_set(),
+            )
         finally:
+            stop.set()
+            stop_task.cancel()
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(stop_task, *tasks, return_exceptions=True)
+            # Collector teardown belongs here, next to sink teardown, once
+            # HTTPCollector.aclose() lands (pooled httpx clients).
             await self.delivery.close()
+        if dead_worker_error is not None:
+            raise dead_worker_error
+
+    def _dead_worker_error(
+        self,
+        done: set[asyncio.Task[None]],
+        *,
+        stop_task: asyncio.Task[bool],
+        stopping: bool,
+    ) -> BaseException | None:
+        """Log every worker that finished before the stop event and return the first error."""
+
+        first: BaseException | None = None
+        for task in done:
+            if task is stop_task or task.cancelled():
+                continue
+            error = task.exception()
+            if error is not None:
+                logger.error(
+                    "worker=%s died with an unhandled exception; shutting down runtime",
+                    task.get_name(),
+                    exc_info=error,
+                )
+            elif stopping:
+                continue
+            else:
+                logger.error(
+                    "worker=%s ended on its own without an error; shutting down runtime",
+                    task.get_name(),
+                )
+                error = RuntimeError(f"runtime worker {task.get_name()} ended unexpectedly")
+            if first is None:
+                first = error
+        return first
 
     async def _source_loop(self, source: RuntimeSource, stop: asyncio.Event) -> None:
+        """Poll one source until stopped, surviving unexpected per-iteration failures.
+
+        Everything in an iteration can fail, not just the collector call: health
+        persistence is a database write and can raise ``database is locked``. Without
+        this guard such a failure would end the worker permanently while the process
+        kept looking healthy. An unexpected failure is logged and retried after the
+        configured poll interval -- never faster, so a repeatedly broken iteration
+        cannot hammer the remote source.
+        """
+
         while not stop.is_set():
-            result = await self._run_source(source)
+            try:
+                delay = (await self._run_source(source)).delay
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "source=%s iteration failed unexpectedly; retrying in %.1fs",
+                    source.collector.identity.key,
+                    source.config.interval,
+                )
+                delay = source.config.interval
             if stop.is_set():
                 break
-            await self._sleep_or_stop(result.delay, stop)
+            await self._sleep_or_stop(delay, stop)
 
     async def _sleep_or_stop(self, delay: float, stop: asyncio.Event) -> None:
         if delay <= 0:

@@ -46,6 +46,7 @@ dev = [
 
 [project.scripts]
 signalkit = "signalkit_stream.cli:main"
+signalkit-console = "signalkit_stream.dashboard_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/1264585648/signalkit-stream"
@@ -54,6 +55,9 @@ Issues = "https://github.com/1264585648/signalkit-stream/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+signalkit_stream = ["web_assets/*.html", "web_assets/*.css", "web_assets/*.js"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

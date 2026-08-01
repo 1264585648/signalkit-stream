@@ -25,6 +25,9 @@ The project follows a forward-only persistent-database policy. `SignalEvent.sche
 - SQLite lock/busy diagnostics, configurable embedded-store timeout, and WAL backup behavior tests
 - subprocess lifecycle tests covering graceful SIGTERM restart and abrupt death during an in-flight webhook followed by idempotent replay
 - clean wheel and source-distribution installation smoke checks in CI
+- bounded active-thread comment refresh for Hacker News and Reddit
+- mutation-safe RSS/Atom pagination anchors
+- per-collector HTTP request backpressure and deadline-aware retry refusal
 
 ### Reliability and compatibility
 
@@ -37,6 +40,11 @@ The project follows a forward-only persistent-database policy. `SignalEvent.sche
 - failed backup replacement leaves the previous verified backup intact
 - SQLite lock timeouts do not partially persist application writes
 - remote webhook side effects can be replayed after abrupt process death with the same version-specific idempotency key
+- GitHub incremental search uses an inclusive second-level watermark overlap to prevent boundary gaps
+- GitHub comment collection selects the latest bounded window and reports incomplete search results
+- Hacker News and Reddit revisit recent threads after catching up so later comments are not permanently missed
+- RSS/Atom collection restarts a changed partial feed snapshot instead of blindly advancing an unsafe offset
+- standard and source-specific rate-limit reset headers are normalized without confusing relative seconds and epoch timestamps
 
 ### Documentation
 
@@ -49,6 +57,7 @@ The project follows a forward-only persistent-database policy. `SignalEvent.sche
 - monitoring/structured logging in `docs/OBSERVABILITY.md`
 - process/SQLite/delivery operations in `docs/OPERATIONS.md`
 - live compatibility testing in `docs/LIVE_TESTING.md`
+- collection freshness, bounded replay, and active-thread refresh in `docs/COLLECTION_RELIABILITY.md`
 - remaining 1.0 work in `docs/ROADMAP.md`
 
 ## Release-note policy

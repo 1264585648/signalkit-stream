@@ -25,7 +25,11 @@ def test_default_registry_builds_first_party_collectors(monkeypatch) -> None:
         SourceConfig("json-a", "jsonfeed", options={"url": "https://example.com/feed.json"})
     )
     hn = registry.create(
-        SourceConfig("hn-a", "hackernews", options={"feed": "askstories", "comments": 2})
+        SourceConfig(
+            "hn-a",
+            "hackernews",
+            options={"feed": "askstories", "comments": 2, "comment_refresh": 4},
+        )
     )
     github = registry.create(
         SourceConfig(
@@ -41,6 +45,7 @@ def test_default_registry_builds_first_party_collectors(monkeypatch) -> None:
             options={
                 "subreddit": "SaaS",
                 "comments": 3,
+                "comment_refresh": 6,
                 "client_id_env": "TEST_REDDIT_CLIENT_ID",
                 "client_secret_env": "TEST_REDDIT_CLIENT_SECRET",
                 "user_agent_env": "TEST_REDDIT_USER_AGENT",
@@ -52,11 +57,13 @@ def test_default_registry_builds_first_party_collectors(monkeypatch) -> None:
     assert isinstance(jsonfeed, JSONFeedCollector)
     assert jsonfeed.identity.key == "jsonfeed:json-a"
     assert isinstance(hn, HackerNewsCollector)
+    assert hn.comment_refresh_window == 4
     assert isinstance(github, GitHubCollector)
     assert github.token == "secret"
     assert isinstance(reddit, RedditCollector)
     assert reddit.identity.key == "reddit:reddit-a"
     assert reddit.comments_per_post == 3
+    assert reddit.comment_refresh_window == 6
     assert registry.types == ("github", "hackernews", "jsonfeed", "reddit", "rss")
 
 

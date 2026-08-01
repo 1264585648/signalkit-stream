@@ -32,6 +32,7 @@ class HackerNewsCollector(HTTPCollector):
         feed: HNFeed = "newstories",
         include_comments: bool = False,
         comments_per_story: int = 3,
+        comment_refresh_window: int = 10,
         client: httpx.AsyncClient | None = None,
         timeout: float = 20.0,
         retry_policy: RetryPolicy | None = None,
@@ -41,6 +42,7 @@ class HackerNewsCollector(HTTPCollector):
         self.feed = feed
         self.include_comments = include_comments
         self.comments_per_story = max(0, comments_per_story)
+        self.comment_refresh_window = max(0, comment_refresh_window)
         self.seen_window = max(50, seen_window)
         self.source = "hackernews"
         self.instance = feed
@@ -53,7 +55,9 @@ class HackerNewsCollector(HTTPCollector):
     ) -> CollectorResult:
         ctx = self.context(context)
         self.validate_cursor(cursor)
-        seen_ids = [int(value) for value in (cursor.state.get("seen_ids", []) if cursor else [])]
+        state = dict(cursor.state) if cursor else {}
+        seen_ids = [int(value) for value in state.get("seen_ids", [])]
+        refresh_ids = [int(value) for value in state.get("comment_refresh_ids", seen_ids)]
         seen = set(seen_ids)
 
         async with self.http_client() as client:
@@ -79,23 +83,71 @@ class HackerNewsCollector(HTTPCollector):
                 event = self._story_event(story)
                 events.append(event)
                 if self.include_comments and self.comments_per_story:
-                    comment_ids = list(story.get("kids") or [])[: self.comments_per_story]
-                    comments = await asyncio.gather(
-                        *(
-                            self._get_item(client, int(comment_id), context=ctx)
-                            for comment_id in comment_ids
+                    events.extend(
+                        await self._comment_events_for_story(
+                            client,
+                            story=story,
+                            parent_event_id=event.id,
+                            context=ctx,
                         )
                     )
+
+            caught_up = len(candidates) <= len(story_ids)
+            if (
+                caught_up
+                and self.include_comments
+                and self.comments_per_story
+                and self.comment_refresh_window
+            ):
+                new_story_ids = set(story_ids)
+                refresh_story_ids = [
+                    story_id
+                    for story_id in dict.fromkeys([*processed_ids, *refresh_ids, *seen_ids])
+                    if story_id not in new_story_ids
+                ][: self.comment_refresh_window]
+                refreshed_stories = await asyncio.gather(
+                    *(
+                        self._get_item(client, story_id, context=ctx)
+                        for story_id in refresh_story_ids
+                    )
+                )
+                for story_id, story in zip(
+                    refresh_story_ids,
+                    refreshed_stories,
+                    strict=True,
+                ):
+                    if not story or story.get("deleted") or story.get("dead"):
+                        continue
+                    parent_event_id = SignalEvent.stable_id(
+                        self.source,
+                        str(story_id),
+                        SignalKind.STORY,
+                        source_instance=self.instance,
+                    )
                     events.extend(
-                        self._comment_event(comment, story_id=story["id"], parent_event_id=event.id)
-                        for comment in comments
-                        if comment and not comment.get("deleted") and not comment.get("dead")
+                        await self._comment_events_for_story(
+                            client,
+                            story=story,
+                            parent_event_id=parent_event_id,
+                            context=ctx,
+                        )
                     )
 
         merged_seen = list(dict.fromkeys([*processed_ids, *seen_ids]))[: self.seen_window]
+        merged_refresh = (
+            list(dict.fromkeys([*processed_ids, *refresh_ids, *seen_ids]))[
+                : self.comment_refresh_window
+            ]
+            if self.comment_refresh_window
+            else []
+        )
         next_cursor = Cursor(
             source_key=self.identity.key,
-            state={"seen_ids": merged_seen, "feed": self.feed},
+            state={
+                "seen_ids": merged_seen,
+                "comment_refresh_ids": merged_refresh,
+                "feed": self.feed,
+            },
         )
         return CollectorResult(
             events=events,
@@ -104,6 +156,44 @@ class HackerNewsCollector(HTTPCollector):
             primary_count=len(story_ids),
             rate_limit=self.rate_limit,
         )
+
+    async def _comment_events_for_story(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        story: dict[str, Any],
+        parent_event_id: str,
+        context: CollectorContext,
+    ) -> list[SignalEvent]:
+        story_id = int(story["id"])
+        comment_ids = self._recent_comment_ids(story)
+        comments = await asyncio.gather(
+            *(
+                self._get_item(client, comment_id, context=context)
+                for comment_id in comment_ids
+            )
+        )
+        return [
+            self._comment_event(
+                comment,
+                story_id=story_id,
+                parent_event_id=parent_event_id,
+            )
+            for comment in comments
+            if comment and not comment.get("deleted") and not comment.get("dead")
+        ]
+
+    def _recent_comment_ids(self, story: dict[str, Any]) -> list[int]:
+        values: set[int] = set()
+        for value in story.get("kids") or []:
+            try:
+                values.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        # Hacker News item IDs are monotonic, so the highest IDs are the newest
+        # direct comments. This avoids permanently pinning collection to the first
+        # highly ranked comments on an active thread.
+        return sorted(values, reverse=True)[: self.comments_per_story]
 
     async def _get_item(
         self,

@@ -28,6 +28,8 @@ The project follows a forward-only persistent-database policy. `SignalEvent.sche
 - bounded active-thread comment refresh for Hacker News and Reddit
 - mutation-safe RSS/Atom pagination anchors
 - per-collector HTTP request backpressure and deadline-aware retry refusal
+- packaged dependency-free SignalKit Operator Console with responsive source, signal, and delivery views
+- `signalkit-console` entry point with read-only defaults and optional dead-letter retry actions
 
 ### Reliability and compatibility
 
@@ -45,6 +47,9 @@ The project follows a forward-only persistent-database policy. `SignalEvent.sche
 - Hacker News and Reddit revisit recent threads after catching up so later comments are not permanently missed
 - RSS/Atom collection restarts a changed partial feed snapshot instead of blindly advancing an unsafe offset
 - standard and source-specific rate-limit reset headers are normalized without confusing relative seconds and epoch timestamps
+- operator-console APIs use read-only SQLite connections, bounded query parameters, escaped literal search, and structured failures
+- non-loopback console binds and mutating actions require separate explicit opt-ins
+- event links are restricted to HTTP(S), static responses carry restrictive browser security headers, and user data is rendered through DOM text nodes
 
 ### Documentation
 
@@ -58,6 +63,7 @@ The project follows a forward-only persistent-database policy. `SignalEvent.sche
 - process/SQLite/delivery operations in `docs/OPERATIONS.md`
 - live compatibility testing in `docs/LIVE_TESTING.md`
 - collection freshness, bounded replay, and active-thread refresh in `docs/COLLECTION_RELIABILITY.md`
+- local console operation and network-safety guidance in `docs/OPERATOR_CONSOLE.md`
 - remaining 1.0 work in `docs/ROADMAP.md`
 
 ## Release-note policy

@@ -40,6 +40,25 @@ def listing(*items: dict[str, object], after: str | None = None) -> dict[str, ob
     return {"kind": "Listing", "data": {"after": after, "children": list(items)}}
 
 
+def comment(comment_id: str, body: str) -> dict[str, object]:
+    return {
+        "kind": "t1",
+        "data": {
+            "id": comment_id,
+            "name": f"t1_{comment_id}",
+            "body": body,
+            "author": "bob",
+            "subreddit": "SaaS",
+            "permalink": f"/r/SaaS/comments/abc/example/{comment_id}/",
+            "created_utc": 1784977200,
+            "edited": False,
+            "score": 3,
+            "parent_id": "t3_abc",
+            "link_id": "t3_abc",
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_reddit_oauth_post_comments_and_rate_limit_normalization() -> None:
     token_calls = 0
@@ -69,6 +88,7 @@ async def test_reddit_oauth_post_comments_and_rate_limit_normalization() -> None
                 },
             )
         if request.url.path == "/comments/abc":
+            assert request.url.params["sort"] == "new"
             return httpx.Response(
                 200,
                 json=[
@@ -77,22 +97,7 @@ async def test_reddit_oauth_post_comments_and_rate_limit_normalization() -> None
                         "kind": "Listing",
                         "data": {
                             "children": [
-                                {
-                                    "kind": "t1",
-                                    "data": {
-                                        "id": "c1",
-                                        "name": "t1_c1",
-                                        "body": "Try an open source option.",
-                                        "author": "bob",
-                                        "subreddit": "SaaS",
-                                        "permalink": "/r/SaaS/comments/abc/example/c1/",
-                                        "created_utc": 1784977200,
-                                        "edited": False,
-                                        "score": 3,
-                                        "parent_id": "t3_abc",
-                                        "link_id": "t3_abc",
-                                    },
-                                },
+                                comment("c1", "Try an open source option."),
                                 {"kind": "more", "data": {"children": ["c2"]}},
                             ]
                         },
@@ -178,6 +183,54 @@ async def test_reddit_cursor_pages_then_stops_at_previous_watermark() -> None:
     assert third.has_more is False
     assert third.cursor is not None
     assert third.cursor.state["seen_ids"][:4] == ["t3_p4", "t3_p3", "t3_p2", "t3_p1"]
+
+
+@pytest.mark.asyncio
+async def test_reddit_refreshes_recent_post_for_new_comments() -> None:
+    cycle = 1
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal cycle
+        if request.url.path == "/api/v1/access_token":
+            return httpx.Response(200, json={"access_token": "token", "expires_in": 3600})
+        if request.url.path == "/r/SaaS/new":
+            return httpx.Response(200, json=listing(post("abc", "Need a CRM")))
+        if request.url.path == "/comments/abc":
+            assert request.url.params["sort"] == "new"
+            current = (
+                comment("c1", "first reply")
+                if cycle == 1
+                else comment("c2", "new reply")
+            )
+            return httpx.Response(
+                200,
+                json=[listing(), listing(current)],
+                request=request,
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        collector = RedditCollector(
+            "SaaS",
+            client_id="client",
+            client_secret="secret",
+            user_agent="signalkit-test/1.0",
+            include_comments=True,
+            comments_per_post=1,
+            comment_refresh_window=1,
+            client=client,
+        )
+        first = await collector.collect(context=CollectorContext(limit=10))
+        cycle = 2
+        second = await collector.collect(
+            context=CollectorContext(limit=10),
+            cursor=first.cursor,
+        )
+
+    assert [event.metadata["external_id"] for event in first.events] == ["t3_abc", "t1_c1"]
+    assert second.primary_count == 0
+    assert [event.metadata["external_id"] for event in second.events] == ["t1_c2"]
+    assert second.events[0].metadata["parent_event_id"] == first.events[0].id
 
 
 @pytest.mark.asyncio

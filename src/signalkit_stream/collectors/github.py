@@ -8,7 +8,13 @@ import httpx
 
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
-from signalkit_stream.protocol import CollectorContext, CollectorResult, Cursor
+from signalkit_stream.protocol import (
+    CollectorContext,
+    CollectorError,
+    CollectorErrorKind,
+    CollectorResult,
+    Cursor,
+)
 
 
 class GitHubCollector(HTTPCollector):
@@ -53,7 +59,9 @@ class GitHubCollector(HTTPCollector):
         page_size = max(1, min(100, int(state.get("per_page", min(ctx.limit, 100)))))
         effective_query = self.query
         if watermark:
-            effective_query = f"{effective_query} updated:>{self._github_time(watermark)}"
+            # Inclusive overlap prevents missing objects updated in the same second as
+            # the committed watermark. Stable event IDs make the replay idempotent.
+            effective_query = f"{effective_query} updated:>={self._github_time(watermark)}"
 
         headers = {
             "Accept": "application/vnd.github+json",
@@ -62,6 +70,7 @@ class GitHubCollector(HTTPCollector):
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
 
+        warnings: list[str] = []
         async with self.http_client() as client:
             response = await self.request(
                 client,
@@ -77,14 +86,23 @@ class GitHubCollector(HTTPCollector):
                 },
                 headers=headers,
             )
-            payload = response.json()
-            items = payload.get("items", []) if isinstance(payload, dict) else []
-            total_count = int(payload.get("total_count", len(items))) if isinstance(payload, dict) else len(items)
+            payload = self._json_object(response, "GitHub issue search")
+            items = payload.get("items", [])
+            if not isinstance(items, list):
+                raise self._parse_error("GitHub issue search items must be a list")
+            total_count = int(payload.get("total_count", len(items)))
+            if payload.get("incomplete_results") is True:
+                warnings.append(
+                    "GitHub search reported incomplete_results; this page may be missing matches"
+                )
 
             selected_items = items[offset : offset + ctx.limit]
             events: list[SignalEvent] = []
             batch_watermark = watermark
             for item in selected_items:
+                if not isinstance(item, dict):
+                    warnings.append("ignored malformed GitHub search item")
+                    continue
                 event = self._item_event(item)
                 events.append(event)
                 timestamp = event.updated_at or event.created_at
@@ -138,6 +156,7 @@ class GitHubCollector(HTTPCollector):
             has_more=has_more,
             primary_count=len(selected_items),
             rate_limit=self.rate_limit,
+            warnings=warnings,
         )
 
     def _item_event(self, item: dict[str, Any]) -> SignalEvent:
@@ -146,7 +165,11 @@ class GitHubCollector(HTTPCollector):
         repository_url = str(item.get("repository_url", ""))
         number = item.get("number")
         external_id = str(item.get("node_id") or f"{repository_url}#{number}")
-        labels = [label.get("name") for label in item.get("labels", []) if label.get("name")]
+        labels = [
+            label.get("name")
+            for label in item.get("labels", [])
+            if isinstance(label, dict) and label.get("name")
+        ]
 
         return SignalEvent(
             id=SignalEvent.stable_id(
@@ -193,14 +216,25 @@ class GitHubCollector(HTTPCollector):
             "GET",
             f"{repository_url}/issues/{number}/comments",
             context=context,
-            params={"per_page": min(self.comments_per_item, 100), "sort": "created", "direction": "asc"},
+            params={
+                "per_page": min(self.comments_per_item, 100),
+                "sort": "created",
+                "direction": "desc",
+            },
             headers=headers,
         )
-        payload = response.json()
+        payload = self._json_value(response, "GitHub comments")
         comments = payload if isinstance(payload, list) else []
         result: list[SignalEvent] = []
-        for comment in comments[: self.comments_per_item]:
-            external_id = str(comment.get("node_id") or comment.get("id"))
+        # GitHub returns newest-first for direction=desc. Emit chronologically while
+        # still selecting the latest bounded window.
+        for comment in reversed(comments[: self.comments_per_item]):
+            if not isinstance(comment, dict):
+                continue
+            raw_external_id = comment.get("node_id") or comment.get("id")
+            if raw_external_id is None:
+                continue
+            external_id = str(raw_external_id)
             result.append(
                 SignalEvent(
                     id=SignalEvent.stable_id(
@@ -217,7 +251,9 @@ class GitHubCollector(HTTPCollector):
                     url=str(comment.get("html_url") or item.get("html_url")),
                     created_at=self._parse_time(comment.get("created_at")),
                     updated_at=(
-                        self._parse_time(comment.get("updated_at")) if comment.get("updated_at") else None
+                        self._parse_time(comment.get("updated_at"))
+                        if comment.get("updated_at")
+                        else None
                     ),
                     metadata={
                         "external_id": external_id,
@@ -228,6 +264,26 @@ class GitHubCollector(HTTPCollector):
                 )
             )
         return result
+
+    def _json_object(self, response: httpx.Response, label: str) -> dict[str, Any]:
+        payload = self._json_value(response, label)
+        if not isinstance(payload, dict):
+            raise self._parse_error(f"{label} response must be an object")
+        return payload
+
+    def _json_value(self, response: httpx.Response, label: str) -> Any:
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise self._parse_error(f"invalid JSON in {label} response") from exc
+
+    def _parse_error(self, message: str) -> CollectorError:
+        return CollectorError(
+            message,
+            kind=CollectorErrorKind.PARSE,
+            source_key=self.identity.key,
+            retryable=False,
+        )
 
     @staticmethod
     def _parse_time(value: str | None) -> datetime:

@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0b0d12">
+  <title>SignalKit Operator Console</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script defer src="/assets/app.js"></script>
+</head>
+<body>
+  <div class="app-shell" id="appShell">
+    <aside class="sidebar" aria-label="Primary navigation">
+      <a class="brand" href="#overview" aria-label="SignalKit home">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="brand-copy">
+          <strong>SignalKit</strong>
+          <small>Stream console</small>
+        </span>
+      </a>
+
+      <nav class="nav-list">
+        <a class="nav-item is-active" href="#overview" data-nav="overview">
+          <span class="nav-icon" aria-hidden="true">⌂</span>
+          <span>Overview</span>
+        </a>
+        <a class="nav-item" href="#signals" data-nav="signals">
+          <span class="nav-icon" aria-hidden="true">≋</span>
+          <span>Signals</span>
+          <span class="nav-badge" id="navSignalCount">—</span>
+        </a>
+        <a class="nav-item" href="#sources" data-nav="sources">
+          <span class="nav-icon" aria-hidden="true">⌁</span>
+          <span>Sources</span>
+          <span class="nav-dot" id="sourceHealthDot" aria-hidden="true"></span>
+        </a>
+        <a class="nav-item" href="#delivery" data-nav="delivery">
+          <span class="nav-icon" aria-hidden="true">⇢</span>
+          <span>Delivery</span>
+          <span class="nav-badge is-alert" id="navDeliveryCount" hidden>0</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="connection-card" id="connectionCard">
+          <span class="status-pulse" aria-hidden="true"></span>
+          <span>
+            <strong id="connectionLabel">Connecting</strong>
+            <small id="databaseLabel">Reading database…</small>
+          </span>
+        </div>
+        <p class="shortcut-hint"><kbd>/</kbd> search <kbd>R</kbd> refresh</p>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Public-signal ingestion</p>
+          <h1 id="pageTitle">Operational overview</h1>
+        </div>
+        <div class="topbar-actions">
+          <label class="auto-refresh-control" title="Refresh dashboard automatically">
+            <span>Auto refresh</span>
+            <select id="refreshInterval" aria-label="Auto refresh interval">
+              <option value="0">Off</option>
+              <option value="15">15 sec</option>
+              <option value="30" selected>30 sec</option>
+              <option value="60">1 min</option>
+            </select>
+          </label>
+          <button class="button button-secondary" id="refreshButton" type="button">
+            <span class="refresh-icon" aria-hidden="true">↻</span>
+            Refresh
+          </button>
+        </div>
+      </header>
+
+      <div class="global-notice" id="globalNotice" role="status" hidden>
+        <div>
+          <strong id="noticeTitle">Unable to read Stream state</strong>
+          <p id="noticeMessage"></p>
+        </div>
+        <button class="button button-quiet" id="noticeRetry" type="button">Retry</button>
+      </div>
+
+      <section class="page-section" id="overview" aria-labelledby="overviewHeading">
+        <div class="health-hero skeleton-target" id="healthHero">
+          <div class="health-orb" aria-hidden="true"><span></span></div>
+          <div class="health-copy">
+            <p class="section-kicker">System health</p>
+            <h2 id="overviewHeading">Checking your ingestion stream…</h2>
+            <p id="healthSummary">Loading source and delivery state.</p>
+          </div>
+          <div class="hero-meta">
+            <span id="schemaBadge" class="pill">Schema —</span>
+            <span id="lastUpdated">Not refreshed yet</span>
+          </div>
+        </div>
+
+        <div class="metric-grid" aria-label="Stream metrics">
+          <article class="metric-card skeleton-target">
+            <div class="metric-label"><span>Stored signals</span><span class="metric-icon">◎</span></div>
+            <strong class="metric-value" id="metricSignals">—</strong>
+            <p><span id="metricLastHour">—</span> collected in the last hour</p>
+          </article>
+          <article class="metric-card skeleton-target">
+            <div class="metric-label"><span>24-hour activity</span><span class="metric-icon">↗</span></div>
+            <strong class="metric-value" id="metricActivity">—</strong>
+            <p>New or updated signals observed</p>
+          </article>
+          <article class="metric-card skeleton-target">
+            <div class="metric-label"><span>Healthy sources</span><span class="metric-icon">⌁</span></div>
+            <strong class="metric-value" id="metricSources">—</strong>
+            <p id="metricSourcesHint">Waiting for source status</p>
+          </article>
+          <article class="metric-card skeleton-target">
+            <div class="metric-label"><span>Delivery attention</span><span class="metric-icon">!</span></div>
+            <strong class="metric-value" id="metricDelivery">—</strong>
+            <p>Failed or dead delivery rows</p>
+          </article>
+        </div>
+
+        <div class="overview-grid">
+          <article class="panel panel-wide" id="activityPanel">
+            <div class="panel-header">
+              <div>
+                <p class="section-kicker">Latest activity</p>
+                <h2>Recent signals</h2>
+              </div>
+              <a class="text-link" href="#signals">View all <span aria-hidden="true">→</span></a>
+            </div>
+            <div class="compact-event-list" id="recentSignalList" aria-live="polite">
+              <div class="loading-row"></div><div class="loading-row"></div><div class="loading-row"></div>
+            </div>
+          </article>
+
+          <article class="panel" id="attentionPanel">
+            <div class="panel-header">
+              <div>
+                <p class="section-kicker">Attention</p>
+                <h2>What needs review</h2>
+              </div>
+            </div>
+            <div class="attention-list" id="attentionList">
+              <div class="loading-row"></div><div class="loading-row"></div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="page-section" id="signals" aria-labelledby="signalsHeading">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">Normalized event stream</p>
+            <h2 id="signalsHeading">Signals</h2>
+            <p>Search across titles, content, authors, and URLs. Newest collection activity appears first.</p>
+          </div>
+          <span class="result-count" id="resultCount">— results</span>
+        </div>
+
+        <div class="filter-bar" role="search">
+          <label class="search-field">
+            <span aria-hidden="true">⌕</span>
+            <input id="signalSearch" type="search" placeholder="Search signals…" autocomplete="off">
+            <kbd>/</kbd>
+          </label>
+          <label class="select-field">
+            <span>Source</span>
+            <select id="sourceFilter"><option value="">All sources</option></select>
+          </label>
+          <label class="select-field">
+            <span>Kind</span>
+            <select id="kindFilter"><option value="">All kinds</option></select>
+          </label>
+          <button class="button button-quiet" id="clearFilters" type="button">Clear</button>
+        </div>
+
+        <div class="signal-table-shell">
+          <div class="signal-table-head" aria-hidden="true">
+            <span>Signal</span><span>Source</span><span>Observed</span><span></span>
+          </div>
+          <div class="signal-list" id="signalList" aria-live="polite"></div>
+          <div class="empty-state" id="signalEmpty" hidden>
+            <div class="empty-icon" aria-hidden="true">⌕</div>
+            <h3>No signals match these filters</h3>
+            <p>Clear the search or choose a different source and kind.</p>
+            <button class="button button-secondary" id="emptyClearFilters" type="button">Reset filters</button>
+          </div>
+          <div class="pagination" id="pagination">
+            <button class="button button-secondary" id="previousPage" type="button">← Previous</button>
+            <span id="pageStatus">Page 1</span>
+            <button class="button button-secondary" id="nextPage" type="button">Next →</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="page-section" id="sources" aria-labelledby="sourcesHeading">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">Collection workers</p>
+            <h2 id="sourcesHeading">Source health</h2>
+            <p>Persisted status, throughput, failures, and the last successful poll for every source instance.</p>
+          </div>
+        </div>
+        <div class="source-grid" id="sourceGrid" aria-live="polite"></div>
+        <div class="empty-state" id="sourceEmpty" hidden>
+          <div class="empty-icon" aria-hidden="true">⌁</div>
+          <h3>No source health records yet</h3>
+          <p>Start the runtime once to create persisted source status.</p>
+          <code>signalkit run signalkit.toml --once</code>
+        </div>
+      </section>
+
+      <section class="page-section" id="delivery" aria-labelledby="deliveryHeading">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">Transactional outbox</p>
+            <h2 id="deliveryHeading">Delivery</h2>
+            <p>Review sink state, retry pressure, dead letters, and successful downstream delivery.</p>
+          </div>
+          <span class="mode-chip" id="actionModeChip">Read-only</span>
+        </div>
+        <div class="delivery-grid" id="deliveryGrid" aria-live="polite"></div>
+        <div class="empty-state" id="deliveryEmpty" hidden>
+          <div class="empty-icon" aria-hidden="true">⇢</div>
+          <h3>No delivery sinks are registered</h3>
+          <p>Add a sink to your configuration and run Stream to initialize its outbox state.</p>
+        </div>
+      </section>
+
+      <footer class="app-footer">
+        <span>SignalKit Stream Operator Console</span>
+        <span id="footerDatabase">Database unavailable</span>
+      </footer>
+    </main>
+  </div>
+
+  <aside class="detail-drawer" id="detailDrawer" aria-hidden="true" aria-labelledby="drawerTitle">
+    <div class="drawer-scrim" data-close-drawer></div>
+    <div class="drawer-panel" role="dialog" aria-modal="true">
+      <div class="drawer-header">
+        <div>
+          <p class="section-kicker" id="drawerKind">Signal</p>
+          <h2 id="drawerTitle">Signal details</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-drawer aria-label="Close details">×</button>
+      </div>
+      <div class="drawer-body" id="drawerBody"></div>
+      <div class="drawer-footer">
+        <button class="button button-secondary" id="copySignalJson" type="button">Copy JSON</button>
+        <a class="button button-primary" id="openOriginal" href="#" target="_blank" rel="noopener noreferrer">Open original ↗</a>
+      </div>
+    </div>
+  </aside>
+
+  <dialog class="action-dialog" id="retryDialog">
+    <form method="dialog">
+      <div class="dialog-icon" aria-hidden="true">↻</div>
+      <h2>Retry dead deliveries?</h2>
+      <p id="retryDialogCopy">This will queue dead rows for another delivery attempt.</p>
+      <div class="dialog-actions">
+        <button class="button button-secondary" value="cancel">Cancel</button>
+        <button class="button button-primary" id="confirmRetry" value="confirm">Queue retry</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>

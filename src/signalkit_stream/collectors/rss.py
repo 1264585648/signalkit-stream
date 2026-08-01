@@ -9,7 +9,13 @@ import httpx
 from signalkit_stream.collectors._text import html_to_text
 from signalkit_stream.collectors.base import HTTPCollector, RetryPolicy
 from signalkit_stream.models import SignalEvent, SignalKind
-from signalkit_stream.protocol import CollectorContext, CollectorError, CollectorErrorKind, CollectorResult, Cursor
+from signalkit_stream.protocol import (
+    CollectorContext,
+    CollectorError,
+    CollectorErrorKind,
+    CollectorResult,
+    Cursor,
+)
 
 
 class RSSCollector(HTTPCollector):
@@ -38,13 +44,14 @@ class RSSCollector(HTTPCollector):
     ) -> CollectorResult:
         ctx = self.context(context)
         self.validate_cursor(cursor)
+        state = dict(cursor.state) if cursor else {}
         headers: dict[str, str] = {}
-        offset = int(cursor.state.get("offset", 0)) if cursor else 0
+        offset = max(0, int(state.get("offset", 0)))
         if cursor and offset == 0:
-            if cursor.state.get("etag"):
-                headers["If-None-Match"] = str(cursor.state["etag"])
-            if cursor.state.get("last_modified"):
-                headers["If-Modified-Since"] = str(cursor.state["last_modified"])
+            if state.get("etag"):
+                headers["If-None-Match"] = str(state["etag"])
+            if state.get("last_modified"):
+                headers["If-Modified-Since"] = str(state["last_modified"])
 
         async with self.http_client() as client:
             response = await self.request(client, "GET", self.url, context=ctx, headers=headers)
@@ -68,13 +75,43 @@ class RSSCollector(HTTPCollector):
                 retryable=False,
             ) from exc
 
+        warnings: list[str] = []
+        anchor = str(state.get("page_anchor") or "").strip()
+        if offset and anchor:
+            expected_index = offset - 1
+            anchor_index = next(
+                (
+                    index
+                    for index, entry in enumerate(entries)
+                    if self._entry_external_id(entry, index) == anchor
+                ),
+                None,
+            )
+            if anchor_index != expected_index:
+                # Feeds are frequently mutable newest-first lists. If entries were
+                # inserted or reordered between pages, blindly continuing by offset
+                # can skip the new head entries. Restarting the current feed snapshot
+                # is safe because persistence is idempotent by stable event ID.
+                offset = 0
+                warnings.append(
+                    "RSS/Atom feed changed during pagination; restarted from the beginning to avoid skipped entries"
+                )
+        elif offset > len(entries):
+            offset = 0
+            warnings.append(
+                "RSS/Atom cursor offset exceeded the current feed; restarted from the beginning"
+            )
+
         selected_entries = entries[offset : offset + ctx.limit]
         events: list[SignalEvent] = []
-        for entry in selected_entries:
+        selected_external_ids: list[str] = []
+        for local_index, entry in enumerate(selected_entries):
+            absolute_index = offset + local_index
             link = str(entry["link"] or self.url)
             title = html_to_text(str(entry["title"] or "")) or None
             content = html_to_text(str(entry["content"] or entry["title"] or ""))
-            external_id = str(entry["id"] or link or title or len(events))
+            external_id = self._entry_external_id(entry, absolute_index)
+            selected_external_ids.append(external_id)
             created_at = self._parse_time(entry["published"])
             updated_at = self._parse_optional_time(entry["updated"])
             events.append(
@@ -112,6 +149,7 @@ class RSSCollector(HTTPCollector):
                 "last_modified": response.headers.get("Last-Modified"),
                 "fetched_at": datetime.now(UTC).isoformat(),
                 "offset": next_offset if has_more else 0,
+                "page_anchor": selected_external_ids[-1] if has_more and selected_external_ids else None,
             },
         )
         return CollectorResult(
@@ -120,7 +158,12 @@ class RSSCollector(HTTPCollector):
             has_more=has_more,
             primary_count=len(selected_entries),
             rate_limit=self.rate_limit,
+            warnings=warnings,
         )
+
+    @staticmethod
+    def _entry_external_id(entry: dict[str, object], index: int) -> str:
+        return str(entry["id"] or entry["link"] or entry["title"] or f"entry-{index}")
 
     @classmethod
     def _parse_feed(cls, payload: bytes) -> tuple[str | None, list[dict[str, object]]]:

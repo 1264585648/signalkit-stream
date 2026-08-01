@@ -31,6 +31,24 @@ FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+def rss_feed(*item_ids: str) -> bytes:
+    items = "".join(
+        f"""
+    <item>
+      <guid>{item_id}</guid>
+      <title>{item_id}</title>
+      <link>https://example.com/posts/{item_id}</link>
+      <pubDate>Wed, 01 Jul 2026 10:00:00 GMT</pubDate>
+    </item>"""
+        for item_id in item_ids
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<rss version="2.0"><channel><title>Mutable Feed</title>'
+        f"{items}</channel></rss>"
+    ).encode()
+
+
 @pytest.mark.asyncio
 async def test_rss_collector_normalizes_and_pages_feed() -> None:
     requests: list[httpx.Request] = []
@@ -52,6 +70,7 @@ async def test_rss_collector_normalizes_and_pages_feed() -> None:
 
     assert first.has_more is True
     assert first.primary_count == 1
+    assert first.cursor is not None and first.cursor.state["page_anchor"] == "item-1"
     assert second.has_more is False
     assert second.primary_count == 1
     event = first.events[0]
@@ -82,3 +101,28 @@ async def test_rss_uses_conditional_get_after_feed_is_drained() -> None:
 
     assert second.events == []
     assert second.cursor == first.cursor
+
+
+@pytest.mark.asyncio
+async def test_rss_restarts_page_when_feed_changes_between_batches() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = (
+            rss_feed("item-1", "item-2", "item-3")
+            if calls == 1
+            else rss_feed("item-new", "item-1", "item-2", "item-3")
+        )
+        return httpx.Response(200, content=payload, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        collector = RSSCollector("https://example.com/feed.xml", client=client)
+        first = await collector.collect(context=CollectorContext(limit=2))
+        second = await collector.collect(context=CollectorContext(limit=2), cursor=first.cursor)
+
+    assert [event.metadata["external_id"] for event in first.events] == ["item-1", "item-2"]
+    assert [event.metadata["external_id"] for event in second.events] == ["item-new", "item-1"]
+    assert any("changed during pagination" in warning for warning in second.warnings)
+    assert second.cursor is not None and second.cursor.state["page_anchor"] == "item-1"

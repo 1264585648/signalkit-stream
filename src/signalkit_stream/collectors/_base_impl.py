@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 import random
 
@@ -79,16 +79,22 @@ class HTTPCollector(Collector):
         *,
         client: httpx.AsyncClient | None = None,
         timeout: float = 20.0,
-        user_agent: str = "signalkit-stream/0.2 (+https://github.com/1264585648/signalkit-stream)",
+        user_agent: str = "signalkit-stream/0.7 (+https://github.com/1264585648/signalkit-stream)",
         retry_policy: RetryPolicy | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        max_concurrency: int = 8,
     ) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout must be > 0")
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency must be >= 1")
         self._client = client
         self._timeout = timeout
         self._user_agent = user_agent
         self._retry_policy = retry_policy or RetryPolicy()
         self._sleep = sleep
         self._rate_limit: RateLimitSnapshot | None = None
+        self._request_semaphore = asyncio.Semaphore(max_concurrency)
 
     @property
     def rate_limit(self) -> RateLimitSnapshot | None:
@@ -121,16 +127,12 @@ class HTTPCollector(Collector):
         last_error: Exception | None = None
 
         for attempt in range(1, policy.max_attempts + 1):
-            if ctx.deadline is not None and datetime.now(UTC) >= ctx.deadline:
-                raise CollectorError(
-                    "collector deadline exceeded before HTTP request",
-                    kind=CollectorErrorKind.TIMEOUT,
-                    source_key=self.identity.key,
-                    retryable=True,
-                )
+            self._ensure_deadline(ctx, "before HTTP request")
 
             try:
-                response = await client.request(method, url, **kwargs)
+                async with self._request_semaphore:
+                    self._ensure_deadline(ctx, "while waiting for HTTP request capacity")
+                    response = await client.request(method, url, **kwargs)
                 snapshot = self._rate_limit_from_headers(response)
                 if snapshot is not None:
                     self._rate_limit = snapshot
@@ -150,7 +152,11 @@ class HTTPCollector(Collector):
                         rate_limited=is_rate_limited,
                     )
 
-                await self._sleep(self._retry_delay(attempt, response))
+                await self._sleep_for_retry(
+                    self._retry_delay(attempt, response),
+                    context=ctx,
+                    url=url,
+                )
                 continue
             except CollectorError:
                 raise
@@ -163,7 +169,11 @@ class HTTPCollector(Collector):
                         source_key=self.identity.key,
                         retryable=True,
                     ) from exc
-                await self._sleep(self._retry_delay(attempt, None))
+                await self._sleep_for_retry(
+                    self._retry_delay(attempt, None),
+                    context=ctx,
+                    url=url,
+                )
             except httpx.RequestError as exc:
                 last_error = exc
                 if attempt >= policy.max_attempts:
@@ -173,7 +183,11 @@ class HTTPCollector(Collector):
                         source_key=self.identity.key,
                         retryable=True,
                     ) from exc
-                await self._sleep(self._retry_delay(attempt, None))
+                await self._sleep_for_retry(
+                    self._retry_delay(attempt, None),
+                    context=ctx,
+                    url=url,
+                )
 
         raise CollectorError(
             f"request failed: {url}",
@@ -182,6 +196,37 @@ class HTTPCollector(Collector):
             retryable=True,
             details={"cause": repr(last_error)},
         )
+
+    async def _sleep_for_retry(
+        self,
+        delay: float,
+        *,
+        context: CollectorContext,
+        url: str,
+    ) -> None:
+        if context.deadline is None:
+            await self._sleep(delay)
+            return
+
+        remaining = (context.deadline - datetime.now(UTC)).total_seconds()
+        if remaining <= 0 or delay >= remaining:
+            raise CollectorError(
+                f"collector deadline leaves no time for another request: {url}",
+                kind=CollectorErrorKind.TIMEOUT,
+                source_key=self.identity.key,
+                retryable=True,
+                details={"retry_delay": delay, "remaining": max(0.0, remaining)},
+            )
+        await self._sleep(delay)
+
+    def _ensure_deadline(self, context: CollectorContext, phase: str) -> None:
+        if context.deadline is not None and datetime.now(UTC) >= context.deadline:
+            raise CollectorError(
+                f"collector deadline exceeded {phase}",
+                kind=CollectorErrorKind.TIMEOUT,
+                source_key=self.identity.key,
+                retryable=True,
+            )
 
     def _retry_delay(self, attempt: int, response: httpx.Response | None) -> float:
         if response is not None:
@@ -212,13 +257,25 @@ class HTTPCollector(Collector):
             kind = CollectorErrorKind.AUTH
         else:
             kind = CollectorErrorKind.HTTP
+        details: dict[str, object] = {"response_preview": response.text[:300]}
+        if self._rate_limit is not None:
+            details["rate_limit"] = {
+                "limit": self._rate_limit.limit,
+                "remaining": self._rate_limit.remaining,
+                "reset_at": (
+                    self._rate_limit.reset_at.isoformat()
+                    if self._rate_limit.reset_at is not None
+                    else None
+                ),
+                "retry_after": self._rate_limit.retry_after,
+            }
         return CollectorError(
             f"HTTP {status} for {response.request.url}",
             kind=kind,
             source_key=self.identity.key,
             retryable=retryable,
             status_code=status,
-            details={"response_preview": response.text[:300]},
+            details=details,
         )
 
     @classmethod
@@ -226,26 +283,34 @@ class HTTPCollector(Collector):
         headers = response.headers
         raw_limit = headers.get("X-RateLimit-Limit") or headers.get("RateLimit-Limit")
         raw_remaining = headers.get("X-RateLimit-Remaining") or headers.get("RateLimit-Remaining")
-        raw_reset = headers.get("X-RateLimit-Reset") or headers.get("RateLimit-Reset")
+        raw_epoch_reset = headers.get("X-RateLimit-Reset")
+        raw_delay_reset = headers.get("RateLimit-Reset")
         raw_retry = headers.get("Retry-After")
-        if not any((raw_limit, raw_remaining, raw_reset, raw_retry)):
+        if not any((raw_limit, raw_remaining, raw_epoch_reset, raw_delay_reset, raw_retry)):
             return None
 
         limit = cls._safe_int(raw_limit)
         remaining = cls._safe_int(raw_remaining)
         reset_at: datetime | None = None
-        reset_value = cls._safe_int(raw_reset)
-        if reset_value is not None:
+        epoch_reset = cls._safe_float(raw_epoch_reset)
+        delay_reset = cls._safe_float(raw_delay_reset)
+        if epoch_reset is not None:
             try:
-                reset_at = datetime.fromtimestamp(reset_value, tz=UTC)
+                reset_at = datetime.fromtimestamp(epoch_reset, tz=UTC)
             except (OverflowError, OSError, ValueError):
                 reset_at = None
+        elif delay_reset is not None:
+            reset_at = datetime.now(UTC) + timedelta(seconds=max(0.0, delay_reset))
+
+        retry_after = cls._parse_retry_after(raw_retry)
+        if retry_after is None and remaining == 0 and delay_reset is not None:
+            retry_after = max(0.0, delay_reset)
 
         return RateLimitSnapshot(
             limit=limit,
             remaining=remaining,
             reset_at=reset_at,
-            retry_after=cls._parse_retry_after(raw_retry),
+            retry_after=retry_after,
         )
 
     @staticmethod
@@ -253,7 +318,16 @@ class HTTPCollector(Collector):
         if value is None:
             return None
         try:
-            return int(value)
+            return int(float(value))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _safe_float(value: str | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
         except ValueError:
             return None
 

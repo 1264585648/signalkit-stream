@@ -44,6 +44,7 @@ class RedditCollector(HTTPCollector):
         time_filter: RedditTimeFilter | None = None,
         include_comments: bool = False,
         comments_per_post: int = 0,
+        comment_refresh_window: int = 10,
         seen_window: int = 500,
         instance: str | None = None,
         client: httpx.AsyncClient | None = None,
@@ -87,6 +88,7 @@ class RedditCollector(HTTPCollector):
         self.time_filter = time_filter
         self.include_comments = include_comments
         self.comments_per_post = max(0, min(comments_per_post, 100))
+        self.comment_refresh_window = max(0, comment_refresh_window)
         self.seen_window = max(50, seen_window)
         self.source = "reddit"
         self.instance = instance or f"r-{self.subreddit}-{self.listing}"
@@ -178,12 +180,50 @@ class RedditCollector(HTTPCollector):
                     events.extend(comment_events)
                     if truncated:
                         warnings.append(
-                            f"Reddit comments truncated for post {fullname}; only top-level comments are collected"
+                            f"Reddit comments truncated for post {fullname}; only recent top-level comments are collected"
                         )
 
-        response_after = _optional_text(listing_data.get("after"))
-        next_after = None if reached_watermark else response_after
-        has_more = next_after is not None
+            response_after = _optional_text(listing_data.get("after"))
+            next_after = None if reached_watermark else response_after
+            has_more = next_after is not None
+
+            # Once the newest listing cycle is caught up, revisit a bounded window of
+            # recently seen posts. This captures comments added after the post itself
+            # was first collected without turning every polling cycle into an unbounded
+            # historical crawl. Stable comment IDs make overlapping refreshes safe.
+            if (
+                not has_more
+                and self.include_comments
+                and self.comments_per_post
+                and self.comment_refresh_window
+            ):
+                processed = set(processed_ids)
+                refresh_fullnames = [
+                    fullname
+                    for fullname in prior_seen
+                    if fullname not in processed and fullname.startswith("t3_")
+                ][: self.comment_refresh_window]
+                for fullname in refresh_fullnames:
+                    native_id = fullname[3:]
+                    parent_event_id = SignalEvent.stable_id(
+                        self.source,
+                        fullname,
+                        SignalKind.POST,
+                        source_instance=self.instance,
+                    )
+                    comment_events, truncated = await self._comments(
+                        client,
+                        token=token,
+                        post={"id": native_id},
+                        parent_event_id=parent_event_id,
+                        context=ctx,
+                    )
+                    events.extend(comment_events)
+                    if truncated:
+                        warnings.append(
+                            f"Reddit comments truncated for post {fullname}; only recent top-level comments are collected"
+                        )
+
         merged_seen = self._merge_seen(
             prior_seen,
             processed_ids,
@@ -266,7 +306,7 @@ class RedditCollector(HTTPCollector):
             params={
                 "limit": self.comments_per_post,
                 "depth": 1,
-                "sort": "top",
+                "sort": "new",
                 "raw_json": 1,
             },
             headers=self._api_headers(token),

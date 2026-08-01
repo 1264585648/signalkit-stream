@@ -79,8 +79,13 @@ def _jsonfeed_factory(config: SourceConfig) -> Collector:
 
 def _hackernews_factory(config: SourceConfig) -> Collector:
     options = dict(config.options)
-    _reject_unknown(options, {"feed", "comments", "seen_window"}, config)
+    _reject_unknown(options, {"feed", "comments", "comment_refresh", "seen_window"}, config)
     comments = _nonnegative_int(options.get("comments", 0), "comments", config)
+    comment_refresh = _nonnegative_int(
+        options.get("comment_refresh", 10),
+        "comment_refresh",
+        config,
+    )
     seen_window = _positive_int(options.get("seen_window", 500), "seen_window", config)
     feed = str(options.get("feed", "newstories"))
     allowed = {
@@ -97,6 +102,7 @@ def _hackernews_factory(config: SourceConfig) -> Collector:
         feed=feed,  # type: ignore[arg-type]
         include_comments=comments > 0,
         comments_per_story=comments,
+        comment_refresh_window=comment_refresh,
         seen_window=seen_window,
     )
 
@@ -127,6 +133,7 @@ def _reddit_factory(config: SourceConfig) -> Collector:
             "listing",
             "time_filter",
             "comments",
+            "comment_refresh",
             "seen_window",
             "instance",
             "access_token_env",
@@ -141,6 +148,11 @@ def _reddit_factory(config: SourceConfig) -> Collector:
     listing = str(options.get("listing", "new")).strip().lower()
     time_filter = _optional_string(options.get("time_filter"))
     comments = _nonnegative_int(options.get("comments", 0), "comments", config)
+    comment_refresh = _nonnegative_int(
+        options.get("comment_refresh", 10),
+        "comment_refresh",
+        config,
+    )
     seen_window = _positive_int(options.get("seen_window", 500), "seen_window", config)
 
     access_token = _optional_environment(
@@ -199,6 +211,7 @@ def _reddit_factory(config: SourceConfig) -> Collector:
         time_filter=time_filter,  # type: ignore[arg-type]
         include_comments=comments > 0,
         comments_per_post=comments,
+        comment_refresh_window=comment_refresh,
         seen_window=seen_window,
         instance=_optional_string(options.get("instance")) or config.name,
     )

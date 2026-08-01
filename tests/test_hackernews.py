@@ -57,3 +57,73 @@ async def test_hackernews_stories_comments_and_seen_cursor() -> None:
     assert first.events[1].metadata["parent_event_id"] == first.events[0].id
     assert second.events[0].title == "Another story"
     assert first.events[0].id != second.events[0].id
+
+
+@pytest.mark.asyncio
+async def test_hackernews_refreshes_recent_story_for_new_comments() -> None:
+    cycle = 1
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v0/newstories.json":
+            return httpx.Response(200, json=[101], request=request)
+        if request.url.path == "/v0/item/101.json":
+            kids = [201] if cycle == 1 else [201, 202]
+            return httpx.Response(
+                200,
+                json={
+                    "id": 101,
+                    "type": "story",
+                    "by": "alice",
+                    "time": 1782896400,
+                    "title": "Active discussion",
+                    "kids": kids,
+                },
+                request=request,
+            )
+        if request.url.path == "/v0/item/201.json":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 201,
+                    "type": "comment",
+                    "by": "bob",
+                    "time": 1782896500,
+                    "parent": 101,
+                    "text": "first",
+                },
+                request=request,
+            )
+        if request.url.path == "/v0/item/202.json":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 202,
+                    "type": "comment",
+                    "by": "carol",
+                    "time": 1782896600,
+                    "parent": 101,
+                    "text": "new reply",
+                },
+                request=request,
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        collector = HackerNewsCollector(
+            include_comments=True,
+            comments_per_story=1,
+            comment_refresh_window=1,
+            client=client,
+        )
+        first = await collector.collect(context=CollectorContext(limit=10))
+        cycle = 2
+        second = await collector.collect(
+            context=CollectorContext(limit=10),
+            cursor=first.cursor,
+        )
+
+    assert first.primary_count == 1
+    assert [event.metadata["external_id"] for event in first.events] == ["101", "201"]
+    assert second.primary_count == 0
+    assert [event.metadata["external_id"] for event in second.events] == ["202"]
+    assert second.events[0].metadata["parent_event_id"] == first.events[0].id

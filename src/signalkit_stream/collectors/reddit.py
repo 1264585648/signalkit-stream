@@ -40,6 +40,7 @@ class RedditCollector(_RedditCollector):
         time_filter: RedditTimeFilter | None = None,
         include_comments: bool = False,
         comments_per_post: int = 0,
+        comment_refresh_window: int = 10,
         seen_window: int = 500,
         instance: str | None = None,
         client: httpx.AsyncClient | None = None,
@@ -102,6 +103,7 @@ class RedditCollector(_RedditCollector):
         self.time_filter = time_filter
         self.include_comments = include_comments
         self.comments_per_post = max(0, min(comments_per_post, 100))
+        self.comment_refresh_window = max(0, comment_refresh_window)
         self.seen_window = max(50, seen_window)
         self.source = "reddit"
         self.instance = instance or f"r-{self.subreddit}-{self.listing}"
